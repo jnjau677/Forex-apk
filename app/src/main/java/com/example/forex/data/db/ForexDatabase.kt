@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 
 @Database(
     entities = [SignalEntity::class, AlertEntity::class, WatchlistEntity::class, CandleEntity::class, UserProfileEntity::class, UserSettingsEntity::class],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class ForexDatabase : RoomDatabase() {

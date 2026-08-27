@@ -69,6 +69,37 @@ enum class SignalType(val title: String) {
     NEUTRAL("NEUTRAL / HOLD")
 }
 
+/**
+ * Volatility regime derived from the ATR distribution of the analyzed series.
+ * Drives adaptive stop sizing in [com.example.forex.data.repository.TechnicalAnalysisEngine].
+ */
+enum class VolatilityRegime(val label: String, val atrStopMultiplier: Double) {
+    COMPRESSED("Compressed / Squeeze", 1.2),
+    NORMAL("Normal", 1.5),
+    ELEVATED("Elevated", 1.9),
+    EXTREME("Extreme / News Risk", 2.4)
+}
+
+/**
+ * Result of the volatility-based position sizing model.
+ * Stop distance is expressed as an ATR multiple; lot size solves for the
+ * requested account risk given that stop distance and contract size.
+ */
+data class PositionSizing(
+    val atrValue: Double,          // ATR in price units
+    val atrPips: Double,           // ATR normalized to the pair's pip size
+    val regime: VolatilityRegime,
+    val stopDistance: Double,      // price distance of the stop
+    val stopLossPips: Double,
+    val takeProfit1Pips: Double,
+    val takeProfit2Pips: Double,
+    val riskRewardRatio: Double,   // TP1 / SL
+    val riskAmount: Double,        // absolute account risk in quote currency
+    val contractSize: Double,      // units per standard lot
+    val suggestedLots: Double,     // standard lots (0 when account risk is not applicable)
+    val note: String = ""
+)
+
 data class TradeSignal(
     val id: String,
     val pairSymbol: String,
@@ -85,7 +116,14 @@ data class TradeSignal(
     val macdStatus: String,
     val summaryRationale: String,
     val timestamp: Long = System.currentTimeMillis(),
-    val isBookmarked: Boolean = false
+    val isBookmarked: Boolean = false,
+    // --- Enhanced (ATR / volatility-aware) signal metadata -----------------
+    val atrValue: Double = 0.0,                 // ATR in price units (0 when unavailable)
+    val stopLossPips: Double = 0.0,             // stop distance in pips
+    val volatilityRegime: VolatilityRegime = VolatilityRegime.NORMAL,
+    val suggestedLotSize: Double = 0.0,         // lots for the default 1% account risk
+    val dataQualityScore: Int = 100,            // 0-100 from the validation layer
+    val dataSource: String = "SIMULATION"       // ALPHA_VANTAGE | FCS_API | SIMULATION
 )
 
 enum class AlertCondition(val title: String) {

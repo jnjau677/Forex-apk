@@ -54,10 +54,12 @@ A modern, high-performance Android application built with **Kotlin** and **Jetpa
 
 | Feature | Live Production Mode | Sample / Simulation Mode (Default) |
 |---|---|---|
-| **AI Technical Analysis** | Calls **OpenRouter API** (`google/gemini-2.5-flash`) via `OPENROUTER_API_KEY` | Local rule-based engine simulating RSI, EMA confluence & pattern recognition |
-| **Price Feeds & Candles** | Calls **FCS API** (`fcsapi.com`) via `FCS_API_KEY` for live ticks | Realistic 5-second random-walk tick generator stream & historical candle generator |
+| **AI Technical Analysis** | Calls **OpenRouter API** (`mistralai/mistral-large`) via `OPENROUTER_API_KEY`, grounded on a deterministic indicator fact sheet + the trader's question | Dynamic rule-engine answers recomputed from live candles (intent-aware, ATR/volatility aware) — never canned text |
+| **Price Feeds & Candles** | **Alpha Vantage** (`ALPHAVANTAGE_API_KEY`: FX_DAILY, DIGITAL_CURRENCY_DAILY, CURRENCY_EXCHANGE_RATE realtime quotes; intraday on premium) → **FCS API** (`fcsapi.com`) fallback for intraday bars & ticks | Realistic 5-second random-walk tick generator stream & historical candle generator |
+| **Data Validation** | Every REST tick/candle payload passes `MarketDataValidator` (OHLC invariants, spike/gap/statistics filters, quality score) before entering cache, DB or signals | Same validation layer applied to simulated ticks |
 | **Watchlist & Favorites** | **100% Real Persistence** stored in SQLite via Room DB | **100% Real Persistence** stored in SQLite via Room DB |
-| **Trade Signals & Bookmarks** | Real-time calculation + persistent Room DB storage | Real-time calculation + persistent Room DB storage |
+| **Trade Signals & Bookmarks** | Real-time calculation with **ATR-based stops/targets + volatility-regime position sizing** + persistent Room DB storage | Real-time calculation + persistent Room DB storage |
+| **Background Signal Alerts (`SignalWorker`)** | Periodic WorkManager scan: refreshes validated candles (Alpha Vantage → FCS → Room history), runs the technical engine, persists & notifies only actionable de-duplicated signals | Same pipeline, but analyzed data may originate from the local generator (no random/mock notifications) |
 | **Price & Indicator Alerts** | Local reactive trigger monitoring + Room DB storage | Local reactive trigger monitoring + Room DB storage |
 | **Position Size Calculator** | 100% Real mathematical risk & lot size conversion | 100% Real mathematical risk & lot size conversion |
 
