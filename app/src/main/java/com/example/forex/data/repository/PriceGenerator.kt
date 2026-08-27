@@ -1,6 +1,7 @@
 package com.example.forex.data.repository
 
 import com.example.forex.data.model.*
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -121,6 +122,78 @@ object TechnicalAnalysisEngine {
         }
         
         return result
+    }
+
+    /**
+     * Calculates Moving Average Convergence Divergence (MACD)
+     * Fast EMA, Slow EMA, Signal Line, and Histogram
+     */
+    fun calculateMACD(
+        closes: List<Double>,
+        fastPeriod: Int = 12,
+        slowPeriod: Int = 26,
+        signalPeriod: Int = 9
+    ): MacdData {
+        val size = closes.size
+        if (size < slowPeriod) {
+            return MacdData(
+                macdLine = List(size) { null },
+                signalLine = List(size) { null },
+                histogram = List(size) { null }
+            )
+        }
+
+        val fastEma = calculateEMA(closes, fastPeriod)
+        val slowEma = calculateEMA(closes, slowPeriod)
+
+        val macdLine = ArrayList<Double?>(size)
+        for (i in 0 until size) {
+            val f = fastEma.getOrNull(i)
+            val s = slowEma.getOrNull(i)
+            if (f != null && s != null) {
+                macdLine.add(f - s)
+            } else {
+                macdLine.add(null)
+            }
+        }
+
+        // Calculate Signal Line (EMA of non-null MACD values)
+        val signalLine = ArrayList<Double?>(size)
+        val nonNullMacd = macdLine.filterNotNull()
+
+        if (nonNullMacd.size >= signalPeriod) {
+            val macdEma = calculateEMA(nonNullMacd, signalPeriod)
+            var emaPtr = 0
+            for (i in 0 until size) {
+                if (macdLine[i] != null) {
+                    signalLine.add(macdEma.getOrNull(emaPtr))
+                    emaPtr++
+                } else {
+                    signalLine.add(null)
+                }
+            }
+        } else {
+            for (i in 0 until size) {
+                signalLine.add(null)
+            }
+        }
+
+        val histogram = ArrayList<Double?>(size)
+        for (i in 0 until size) {
+            val m = macdLine.getOrNull(i)
+            val s = signalLine.getOrNull(i)
+            if (m != null && s != null) {
+                histogram.add(m - s)
+            } else {
+                histogram.add(null)
+            }
+        }
+
+        return MacdData(
+            macdLine = macdLine,
+            signalLine = signalLine,
+            histogram = histogram
+        )
     }
 
     /**
@@ -247,16 +320,21 @@ object TechnicalAnalysisEngine {
     /**
      * Generate dynamic trade signal based on full technical confluence
      */
-    fun generateTradeSignal(pair: CurrencyPair, candles: List<CandleStick>, timeframe: Timeframe): TradeSignal {
+    fun generateTradeSignal(
+        pair: CurrencyPair,
+        candles: List<CandleStick>,
+        timeframe: Timeframe,
+        settings: IndicatorSettings = IndicatorSettings()
+    ): TradeSignal {
         val closes = candles.map { it.close }
-        val rsiList = calculateRSI(closes)
+        val rsiList = calculateRSI(closes, settings.rsiPeriod)
         val currentRsi = rsiList.lastOrNull() ?: 50.0
         
-        val ema20List = calculateEMA(closes, 20)
-        val ema50List = calculateEMA(closes, 50)
+        val emaFastList = calculateEMA(closes, settings.emaPeriod1)
+        val emaSlowList = calculateEMA(closes, settings.emaPeriod2)
         
-        val currentEma20 = ema20List.lastOrNull() ?: pair.currentPrice
-        val currentEma50 = ema50List.lastOrNull() ?: pair.currentPrice
+        val currentEmaFast = emaFastList.lastOrNull() ?: pair.currentPrice
+        val currentEmaSlow = emaSlowList.lastOrNull() ?: pair.currentPrice
         
         val patterns = detectPatterns(candles)
         val currentPrice = pair.currentPrice
@@ -264,18 +342,18 @@ object TechnicalAnalysisEngine {
         var score = 0 // + for BUY, - for SELL
         val rationaleList = mutableListOf<String>()
         
-        if (currentEma20 > currentEma50) {
+        if (currentEmaFast > currentEmaSlow) {
             score += 2
-            rationaleList.add("EMA 20/50 Bullish Crossover")
+            rationaleList.add("EMA ${settings.emaPeriod1}/${settings.emaPeriod2} Bullish Cross")
         } else {
             score -= 2
-            rationaleList.add("EMA 20/50 Bearish Crossover")
+            rationaleList.add("EMA ${settings.emaPeriod1}/${settings.emaPeriod2} Bearish Cross")
         }
         
-        if (currentRsi < 35) {
+        if (currentRsi < settings.rsiOversold) {
             score += 3
             rationaleList.add("RSI Oversold (${currentRsi.toInt()})")
-        } else if (currentRsi > 65) {
+        } else if (currentRsi > settings.rsiOverbought) {
             score -= 3
             rationaleList.add("RSI Overbought (${currentRsi.toInt()})")
         } else {
@@ -339,4 +417,190 @@ object TechnicalAnalysisEngine {
             summaryRationale = summary
         )
     }
+
+    /**
+     * Dynamically generates rich AI chart annotations and technical redraw overlays
+     * (Supply/Demand zones, smart trendlines, Fibonacci retracements, and target vectors).
+     */
+    fun generateAiChartOverlay(
+        pair: CurrencyPair,
+        candles: List<CandleStick>,
+        timeframe: Timeframe,
+        focusType: String? = null
+    ): AiChartOverlayState {
+        if (candles.size < 10) {
+            return AiChartOverlayState(pairSymbol = pair.symbol, timeframe = timeframe)
+        }
+
+        val closes = candles.map { it.close }
+        val highs = candles.map { it.high }
+        val lows = candles.map { it.low }
+
+        val minPrice = lows.minOrNull() ?: pair.currentPrice * 0.99
+        val maxPrice = highs.maxOrNull() ?: pair.currentPrice * 1.01
+        val currentPrice = pair.currentPrice
+        val pip = pair.pipSize
+
+        // Find swing highs and swing lows (local extrema)
+        val swingHighs = mutableListOf<Pair<Int, Double>>()
+        val swingLows = mutableListOf<Pair<Int, Double>>()
+
+        val window = 4
+        for (i in window until candles.size - window) {
+            val h = candles[i].high
+            val l = candles[i].low
+            val isHigh = (1..window).all { h >= candles[i - it].high && h >= candles[i + it].high }
+            val isLow = (1..window).all { l <= candles[i - it].low && l <= candles[i + it].low }
+
+            if (isHigh) swingHighs.add(i to h)
+            if (isLow) swingLows.add(i to l)
+        }
+
+        // Zones calculation
+        val zones = mutableListOf<AiZone>()
+        val zoneBuffer = pip * 12.0
+
+        // Major Demand / Support Zone near lowest swing low
+        val primaryLow = swingLows.minByOrNull { it.second }?.second ?: (minPrice + pip * 5)
+        zones.add(
+            AiZone(
+                type = AiZoneType.DEMAND_SUPPORT,
+                priceTop = primaryLow + zoneBuffer * 0.8,
+                priceBottom = primaryLow - zoneBuffer * 0.4,
+                label = "Institutional Demand (${String.format(Locale.US, "%.4f", primaryLow)})",
+                strength = 0.92,
+                confidence = 94
+            )
+        )
+
+        // Major Supply / Resistance Zone near highest swing high
+        val primaryHigh = swingHighs.maxByOrNull { it.second }?.second ?: (maxPrice - pip * 5)
+        zones.add(
+            AiZone(
+                type = AiZoneType.SUPPLY_RESISTANCE,
+                priceTop = primaryHigh + zoneBuffer * 0.4,
+                priceBottom = primaryHigh - zoneBuffer * 0.8,
+                label = "Institutional Supply (${String.format(Locale.US, "%.4f", primaryHigh)})",
+                strength = 0.88,
+                confidence = 91
+            )
+        )
+
+        // Mid-range Liquidity / Flip Zone if enough space
+        if (abs(primaryHigh - primaryLow) > zoneBuffer * 4) {
+            val midLevel = (primaryHigh + primaryLow) / 2.0
+            zones.add(
+                AiZone(
+                    type = AiZoneType.BREAKOUT_ZONE,
+                    priceTop = midLevel + zoneBuffer * 0.4,
+                    priceBottom = midLevel - zoneBuffer * 0.4,
+                    label = "Liquidity Pivot (${String.format(Locale.US, "%.4f", midLevel)})",
+                    strength = 0.75,
+                    confidence = 86
+                )
+            )
+        }
+
+        // Smart Trendlines calculation
+        val trendlines = mutableListOf<AiTrendline>()
+
+        if (swingLows.size >= 2) {
+            val l1 = swingLows[swingLows.size - 2]
+            val l2 = swingLows.last()
+            trendlines.add(
+                AiTrendline(
+                    type = AiTrendlineType.BULLISH_SUPPORT,
+                    candleIndex1 = l1.first,
+                    price1 = l1.second,
+                    candleIndex2 = l2.first,
+                    price2 = l2.second,
+                    label = "AI Ascending Support Vector"
+                )
+            )
+        } else if (candles.size >= 25) {
+            trendlines.add(
+                AiTrendline(
+                    type = AiTrendlineType.BULLISH_SUPPORT,
+                    candleIndex1 = max(0, candles.size - 35),
+                    price1 = lows.takeLast(35).minOrNull() ?: currentPrice,
+                    candleIndex2 = candles.size - 1,
+                    price2 = currentPrice - (pip * 15),
+                    label = "AI Support Trendline"
+                )
+            )
+        }
+
+        if (swingHighs.size >= 2) {
+            val h1 = swingHighs[swingHighs.size - 2]
+            val h2 = swingHighs.last()
+            trendlines.add(
+                AiTrendline(
+                    type = AiTrendlineType.BEARISH_RESISTANCE,
+                    candleIndex1 = h1.first,
+                    price1 = h1.second,
+                    candleIndex2 = h2.first,
+                    price2 = h2.second,
+                    label = "AI Descending Resistance Vector",
+                    isDashed = true
+                )
+            )
+        }
+
+        // Fibonacci calculation from swing low to swing high
+        val fibLow = swingLows.minByOrNull { it.second }?.second ?: minPrice
+        val fibHigh = swingHighs.maxByOrNull { it.second }?.second ?: maxPrice
+        val fibDiff = fibHigh - fibLow
+
+        val fibRatios = listOf(
+            0.0 to Pair("0.0%", "Swing Base"),
+            0.236 to Pair("23.6%", "Minor Retracement"),
+            0.382 to Pair("38.2%", "Healthy Pullback"),
+            0.500 to Pair("50.0%", "Equilibrium Level"),
+            0.618 to Pair("61.8%", "Golden Pocket Zone"),
+            0.786 to Pair("78.6%", "Deep Discount"),
+            1.000 to Pair("100.0%", "Swing Peak")
+        )
+
+        val fibLevels = fibRatios.map { (ratio, info) ->
+            AiFibonacciLevel(
+                ratio = ratio,
+                percentage = info.first,
+                price = fibLow + fibDiff * ratio,
+                description = info.second
+            )
+        }
+
+        // Target projection & execution setup
+        val signal = generateTradeSignal(pair, candles, timeframe)
+        val isBuy = signal.type == SignalType.BUY || (signal.type == SignalType.NEUTRAL && currentPrice > (fibLow + fibHigh) / 2)
+        val targets = listOf(
+            AiTargetProjection(
+                entryPrice = currentPrice,
+                stopLoss = signal.stopLoss,
+                takeProfit1 = signal.takeProfit1,
+                takeProfit2 = signal.takeProfit2,
+                riskRewardRatio = signal.riskRewardRatio,
+                isBuy = isBuy,
+                rationale = "AI Target Model: SL at ${String.format(Locale.US, "%.4f", signal.stopLoss)} | TP1 ${String.format(Locale.US, "%.4f", signal.takeProfit1)} (RR 1:${String.format(Locale.US, "%.1f", signal.riskRewardRatio)})"
+            )
+        )
+
+        val detectedPatterns = detectPatterns(candles)
+
+        return AiChartOverlayState(
+            pairSymbol = pair.symbol,
+            timeframe = timeframe,
+            zones = zones,
+            trendlines = trendlines,
+            targets = targets,
+            fibonacciLevels = fibLevels,
+            fibonacciP1 = fibLow,
+            fibonacciP2 = fibHigh,
+            detectedPatterns = detectedPatterns,
+            analysisSummary = "AI redrew chart structure: ${zones.size} Supply/Demand Zones, ${trendlines.size} Trendlines, Fibonacci Golden Ratio, and ${if (isBuy) "BUY" else "SELL"} Target Projections.",
+            timestamp = System.currentTimeMillis(),
+            isRedrawing = false
+        )
+    }
 }
+

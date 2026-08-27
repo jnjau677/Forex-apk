@@ -15,7 +15,9 @@ import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ShowChart
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.AutoGraph
@@ -25,9 +27,10 @@ import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.HorizontalRule
 import androidx.compose.material.icons.filled.PanTool
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.ShowChart
-import androidx.compose.material.icons.filled.Undo
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.*
 import androidx.compose.animation.fadeIn
@@ -308,6 +311,10 @@ fun CandlestickChartCanvas(
     pair: CurrencyPair,
     indicatorSettings: IndicatorSettings,
     activeSignal: TradeSignal? = null,
+    aiOverlay: AiChartOverlayState? = null,
+    showAiOverlay: Boolean = true,
+    isAnalyzingAi: Boolean = false,
+    onTriggerAiRedraw: (() -> Unit)? = null,
     isFullscreenDialog: Boolean = false,
     onAnalyzeSnapshot: ((Bitmap) -> Unit)? = null,
     isLoading: Boolean = false,
@@ -339,6 +346,28 @@ fun CandlestickChartCanvas(
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var showSavePreviewDialog by remember { mutableStateOf(false) }
     var showDebugOverlay by remember { mutableStateOf(false) }
+    var showOverlays by remember { mutableStateOf(true) }
+    var isAiOverlayActive by remember(showAiOverlay) { mutableStateOf(showAiOverlay) }
+
+    val aiRadarTransition = rememberInfiniteTransition(label = "AiRadarSweep")
+    val aiRadarYProgress by aiRadarTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1800, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "AiRadarY"
+    )
+    val aiGlowPulse by aiRadarTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 0.95f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "AiGlowPulse"
+    )
     
     // Debug overlay state
     var fps by remember { mutableStateOf(0) }
@@ -387,15 +416,30 @@ fun CandlestickChartCanvas(
     }
 
     val closes = remember(candles) { candles.map { it.close } }
-    val sma20 = remember(candles) { TechnicalAnalysisEngine.calculateSMA(closes, 20) }
-    val sma50 = remember(candles) { TechnicalAnalysisEngine.calculateSMA(closes, 50) }
-    val ema20 = remember(candles) { TechnicalAnalysisEngine.calculateEMA(closes, 20) }
-    val ema50 = remember(candles) { TechnicalAnalysisEngine.calculateEMA(closes, 50) }
-    val ema200 = remember(candles) { TechnicalAnalysisEngine.calculateEMA(closes, 200) }
-    val rsiList = remember(candles) { TechnicalAnalysisEngine.calculateRSI(closes, 14) }
-    val bollingerBands = remember(candles) { TechnicalAnalysisEngine.calculateBollingerBands(closes) }
+    val sma20 = remember(candles, indicatorSettings.smaPeriod1) { TechnicalAnalysisEngine.calculateSMA(closes, indicatorSettings.smaPeriod1) }
+    val sma50 = remember(candles, indicatorSettings.smaPeriod2) { TechnicalAnalysisEngine.calculateSMA(closes, indicatorSettings.smaPeriod2) }
+    val ema20 = remember(candles, indicatorSettings.emaPeriod1) { TechnicalAnalysisEngine.calculateEMA(closes, indicatorSettings.emaPeriod1) }
+    val ema50 = remember(candles, indicatorSettings.emaPeriod2) { TechnicalAnalysisEngine.calculateEMA(closes, indicatorSettings.emaPeriod2) }
+    val ema200 = remember(candles, indicatorSettings.emaPeriod3) { TechnicalAnalysisEngine.calculateEMA(closes, indicatorSettings.emaPeriod3) }
+    val rsiList = remember(candles, indicatorSettings.rsiPeriod) { TechnicalAnalysisEngine.calculateRSI(closes, indicatorSettings.rsiPeriod) }
+    val bollingerBands = remember(candles, indicatorSettings.bollingerPeriod, indicatorSettings.bollingerStdDev) { TechnicalAnalysisEngine.calculateBollingerBands(closes, indicatorSettings.bollingerPeriod, indicatorSettings.bollingerStdDev) }
+    val macdData = remember(candles, indicatorSettings.macdFastPeriod, indicatorSettings.macdSlowPeriod, indicatorSettings.macdSignalPeriod) {
+        TechnicalAnalysisEngine.calculateMACD(closes, indicatorSettings.macdFastPeriod, indicatorSettings.macdSlowPeriod, indicatorSettings.macdSignalPeriod)
+    }
     val (supports, resistances) = remember(candles) { TechnicalAnalysisEngine.detectSupportResistance(candles) }
     val detectedPatterns = remember(candles) { TechnicalAnalysisEngine.detectPatterns(candles) }
+
+    val hasRsi = indicatorSettings.showRsiSubchart
+    val hasMacd = indicatorSettings.showMacdSubchart
+    val mainChartWeight = when {
+        hasRsi && hasMacd -> 0.54f
+        hasRsi || hasMacd -> 0.75f
+        else -> 1.0f
+    }
+    val subChartWeight = when {
+        hasRsi && hasMacd -> 0.23f
+        else -> 0.25f
+    }
 
     val textMeasurer = rememberTextMeasurer()
     Box(
@@ -411,7 +455,7 @@ fun CandlestickChartCanvas(
         // Main Candlestick Canvas
         Box(
             modifier = Modifier
-                .weight(if (indicatorSettings.showRsiSubchart) 0.75f else 1f)
+                .weight(mainChartWeight)
                 .fillMaxWidth()
                 .pointerInput(selectedTool) {
                     when (selectedTool) {
@@ -723,12 +767,272 @@ fun CandlestickChartCanvas(
                     }
                 }
 
+                // Draw Real-time WebSocket Live Price Line & Pulsing Tick Indicator
+                val currentLivePrice = pair.currentPrice
+                val yLive = (canvasHeight * (1f - (currentLivePrice - minPrice) / priceRange)).toFloat()
+                if (yLive in 0f..canvasHeight) {
+                    val isLiveBull = (visibleCandles.lastOrNull()?.isBullish ?: true)
+                    val liveColor = if (isLiveBull) Color(0xFF10B981) else Color(0xFFEF4444)
+
+                    // Dashed real-time price tracking line across the entire chart
+                    drawLine(
+                        color = liveColor.copy(alpha = 0.9f),
+                        start = Offset(0f, yLive),
+                        end = Offset(canvasWidth, yLive),
+                        strokeWidth = 2f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f))
+                    )
+
+                    // Glowing pulse on the active candle position
+                    val activeCandleIdx = visibleCandles.lastIndex
+                    if (activeCandleIdx >= 0) {
+                        val activeX = activeCandleIdx * candleWidth + (candleWidth / 2f)
+                        drawCircle(
+                            color = liveColor.copy(alpha = 0.35f),
+                            radius = 10f,
+                            center = Offset(activeX, yLive)
+                        )
+                        drawCircle(
+                            color = liveColor,
+                            radius = 4.5f,
+                            center = Offset(activeX, yLive)
+                        )
+                        drawCircle(
+                            color = textColor,
+                            radius = 2f,
+                            center = Offset(activeX, yLive)
+                        )
+                    }
+
+                    // Price Tag Badge on right edge
+                    val badgeW = 95f
+                    val badgeH = 22f
+                    val badgeX = canvasWidth - badgeW - 6f
+                    val badgeY = (yLive - (badgeH / 2f)).coerceIn(4f, canvasHeight - badgeH - 4f)
+
+                    drawRoundRect(
+                        color = liveColor,
+                        topLeft = Offset(badgeX, badgeY),
+                        size = Size(badgeW, badgeH),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                    )
+                    drawText(
+                        textMeasurer = textMeasurer,
+                        text = String.format(Locale.US, if (pair.pipSize == 0.01) "%.2f" else "%.5f", currentLivePrice),
+                        style = TextStyle(color = bgDark, fontSize = 11.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                        topLeft = Offset(badgeX + 6f, badgeY + 3f)
+                    )
+                }
+
                 // Draw SMA & EMA Curves
                 if (indicatorSettings.showSma20) drawEmaPath(sma20, startIdx, endIdx, candleWidth, minPrice, priceRange, canvasHeight, sma20Color)
                 if (indicatorSettings.showSma50) drawEmaPath(sma50, startIdx, endIdx, candleWidth, minPrice, priceRange, canvasHeight, sma50Color)
                 if (indicatorSettings.showEma20) drawEmaPath(ema20, startIdx, endIdx, candleWidth, minPrice, priceRange, canvasHeight, ema20Color)
                 if (indicatorSettings.showEma50) drawEmaPath(ema50, startIdx, endIdx, candleWidth, minPrice, priceRange, canvasHeight, ema50Color)
                 if (indicatorSettings.showEma200) drawEmaPath(ema200, startIdx, endIdx, candleWidth, minPrice, priceRange, canvasHeight, ema200Color)
+
+                // Draw Dynamic AI Redrawn Chart Structures (Zones, Trendlines, Fibonacci, Targets)
+                if (isAiOverlayActive && aiOverlay != null && aiOverlay.pairSymbol == pair.symbol) {
+                    // 1. AI Supply & Demand Zones
+                    aiOverlay.zones.forEach { zone ->
+                        val yTop = (canvasHeight * (1f - (zone.priceTop - minPrice) / priceRange)).toFloat()
+                        val yBottom = (canvasHeight * (1f - (zone.priceBottom - minPrice) / priceRange)).toFloat()
+                        val rectTop = min(yTop, yBottom)
+                        val rectBottom = max(yTop, yBottom)
+                        val rectH = max(8f, rectBottom - rectTop)
+
+                        val zoneColor = when (zone.type) {
+                            AiZoneType.DEMAND_SUPPORT -> Color(0xFF10B981)
+                            AiZoneType.SUPPLY_RESISTANCE -> Color(0xFFEF4444)
+                            AiZoneType.BREAKOUT_ZONE -> Color(0xFFF59E0B)
+                        }
+
+                        if (rectBottom >= 0f && rectTop <= canvasHeight) {
+                            // Shaded area
+                            drawRect(
+                                color = zoneColor.copy(alpha = 0.12f),
+                                topLeft = Offset(0f, max(0f, rectTop)),
+                                size = Size(canvasWidth, min(canvasHeight - max(0f, rectTop), rectH))
+                            )
+                            // Top & bottom bounds
+                            drawLine(
+                                color = zoneColor.copy(alpha = 0.85f),
+                                start = Offset(0f, rectTop),
+                                end = Offset(canvasWidth, rectTop),
+                                strokeWidth = 2f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 5f))
+                            )
+                            drawLine(
+                                color = zoneColor.copy(alpha = 0.85f),
+                                start = Offset(0f, rectBottom),
+                                end = Offset(canvasWidth, rectBottom),
+                                strokeWidth = 2f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 5f))
+                            )
+                            // Neon AI Badge
+                            val zoneTag = "🤖 ${zone.label} • ${zone.confidence}% Conf"
+                            drawRoundRect(
+                                color = Color(0xFF0F172A).copy(alpha = 0.92f),
+                                topLeft = Offset(14f, max(4f, rectTop + 4f)),
+                                size = Size(210f, 20f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(6f, 6f)
+                            )
+                            drawText(
+                                textMeasurer = textMeasurer,
+                                text = zoneTag,
+                                style = TextStyle(color = zoneColor, fontSize = 9.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                                topLeft = Offset(20f, max(8f, rectTop + 7f))
+                            )
+                        }
+                    }
+
+                    // 2. AI Smart Trendlines & Vectors
+                    aiOverlay.trendlines.forEach { line ->
+                        val x1 = (line.candleIndex1 - startIdx) * candleWidth + (candleWidth / 2f)
+                        val x2 = (line.candleIndex2 - startIdx) * candleWidth + (candleWidth / 2f)
+                        val y1 = (canvasHeight * (1f - (line.price1 - minPrice) / priceRange)).toFloat()
+                        val y2 = (canvasHeight * (1f - (line.price2 - minPrice) / priceRange)).toFloat()
+
+                        val lineColor = if (line.type == AiTrendlineType.BULLISH_SUPPORT) Color(0xFF38BDF8) else Color(0xFFA855F7)
+
+                        drawLine(
+                            color = lineColor,
+                            start = Offset(x1, y1),
+                            end = Offset(x2, y2),
+                            strokeWidth = 3.5f,
+                            pathEffect = if (line.isDashed) PathEffect.dashPathEffect(floatArrayOf(8f, 6f)) else null
+                        )
+
+                        // Glowing Anchor Points
+                        drawCircle(color = lineColor.copy(alpha = 0.45f), radius = 9f, center = Offset(x1, y1))
+                        drawCircle(color = lineColor, radius = 5f, center = Offset(x1, y1))
+                        drawCircle(color = Color.White, radius = 2.5f, center = Offset(x1, y1))
+
+                        drawCircle(color = lineColor.copy(alpha = 0.45f), radius = 9f, center = Offset(x2, y2))
+                        drawCircle(color = lineColor, radius = 5f, center = Offset(x2, y2))
+                        drawCircle(color = Color.White, radius = 2.5f, center = Offset(x2, y2))
+
+                        val midX = (x1 + x2) / 2f
+                        val midY = (y1 + y2) / 2f
+                        if (midX in 0f..canvasWidth && midY in 0f..canvasHeight) {
+                            drawRoundRect(
+                                color = Color(0xFF0F172A).copy(alpha = 0.88f),
+                                topLeft = Offset(midX - 70f, midY - 18f),
+                                size = Size(140f, 18f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                            )
+                            drawText(
+                                textMeasurer = textMeasurer,
+                                text = "🤖 ${line.label}",
+                                style = TextStyle(color = lineColor, fontSize = 8.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                                topLeft = Offset(midX - 64f, midY - 15f)
+                            )
+                        }
+                    }
+
+                    // 3. AI Fibonacci Retracement Levels
+                    aiOverlay.fibonacciLevels.forEach { fib ->
+                        val y = (canvasHeight * (1f - (fib.price - minPrice) / priceRange)).toFloat()
+                        if (y in -10f..(canvasHeight + 10f)) {
+                            val fibColor = when (fib.ratio) {
+                                0.618 -> Color(0xFFF97316) // Golden Pocket
+                                0.500 -> Color(0xFF38BDF8) // Equilibrium
+                                0.382 -> Color(0xFF34D399)
+                                else -> Color(0xFF94A3B8)
+                            }
+                            drawLine(
+                                color = fibColor.copy(alpha = if (fib.ratio == 0.618) 0.95f else 0.75f),
+                                start = Offset(0f, y),
+                                end = Offset(canvasWidth, y),
+                                strokeWidth = if (fib.ratio == 0.618) 2.2f else 1.2f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 4f))
+                            )
+                            val text = "AI FIB ${fib.percentage} (${String.format(Locale.US, "%.5f", fib.price)})"
+                            drawRoundRect(
+                                color = Color(0xFF0F172A).copy(alpha = 0.85f),
+                                topLeft = Offset(canvasWidth - 195f, y - 10f),
+                                size = Size(185f, 18f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                            )
+                            drawText(
+                                textMeasurer = textMeasurer,
+                                text = text,
+                                style = TextStyle(color = fibColor, fontSize = 8.5.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                                topLeft = Offset(canvasWidth - 188f, y - 8f)
+                            )
+                        }
+                    }
+
+                    // 4. AI Target Projections (TP1, TP2, SL)
+                    aiOverlay.targets.forEach { target ->
+                        val ySl = (canvasHeight * (1f - (target.stopLoss - minPrice) / priceRange)).toFloat()
+                        val yTp1 = (canvasHeight * (1f - (target.takeProfit1 - minPrice) / priceRange)).toFloat()
+
+                        if (yTp1 in 0f..canvasHeight) {
+                            drawLine(
+                                color = Color(0xFF10B981),
+                                start = Offset(0f, yTp1),
+                                end = Offset(canvasWidth, yTp1),
+                                strokeWidth = 2f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 4f))
+                            )
+                            val tpText = "🎯 AI TP1: ${String.format(Locale.US, "%.5f", target.takeProfit1)}"
+                            drawRoundRect(
+                                color = Color(0xFF10B981),
+                                topLeft = Offset(14f, yTp1 - 18f),
+                                size = Size(135f, 18f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                            )
+                            drawText(
+                                textMeasurer = textMeasurer,
+                                text = tpText,
+                                style = TextStyle(color = bgDark, fontSize = 8.5.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                                topLeft = Offset(18f, yTp1 - 15f)
+                            )
+                        }
+
+                        if (ySl in 0f..canvasHeight) {
+                            drawLine(
+                                color = Color(0xFFEF4444),
+                                start = Offset(0f, ySl),
+                                end = Offset(canvasWidth, ySl),
+                                strokeWidth = 2f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 4f))
+                            )
+                            val slText = "🛑 AI SL: ${String.format(Locale.US, "%.5f", target.stopLoss)}"
+                            drawRoundRect(
+                                color = Color(0xFFEF4444),
+                                topLeft = Offset(14f, ySl - 18f),
+                                size = Size(130f, 18f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                            )
+                            drawText(
+                                textMeasurer = textMeasurer,
+                                text = slText,
+                                style = TextStyle(color = Color.White, fontSize = 8.5.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                                topLeft = Offset(18f, ySl - 15f)
+                            )
+                        }
+                    }
+                }
+
+                // AI Scanning Radar Sweep Effect when Analyzing or Redrawing
+                if (isAnalyzingAi || aiOverlay?.isRedrawing == true) {
+                    val radarY = canvasHeight * aiRadarYProgress
+                    // Glowing scan beam
+                    drawLine(
+                        color = Color(0xFF38BDF8).copy(alpha = aiGlowPulse),
+                        start = Offset(0f, radarY),
+                        end = Offset(canvasWidth, radarY),
+                        strokeWidth = 2.5f
+                    )
+                    // Glow wash above radar
+                    drawRect(
+                        color = Color(0xFF38BDF8).copy(alpha = 0.04f * aiGlowPulse),
+                        topLeft = Offset(0f, max(0f, radarY - 60f)),
+                        size = Size(canvasWidth, min(60f, radarY))
+                    )
+                }
 
                 // Draw User-Drawn Support, Resistance & Trendlines
                 userDrawnLines.forEach { line ->
@@ -1054,7 +1358,24 @@ fun CandlestickChartCanvas(
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 IconButton(
-                    onClick = { selectedTool = ChartDrawingTool.PAN_ZOOM },
+                    onClick = { showOverlays = !showOverlays },
+                    modifier = Modifier.size(32.dp).testTag("tool_toggle_overlays")
+                ) {
+                    Icon(
+                        imageVector = if (showOverlays) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                        contentDescription = "Toggle Overlays",
+                        tint = textColor,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                AnimatedVisibility(visible = showOverlays) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        IconButton(
+                            onClick = { selectedTool = ChartDrawingTool.PAN_ZOOM },
                     modifier = Modifier
                         .size(32.dp)
                         .background(
@@ -1251,7 +1572,7 @@ fun CandlestickChartCanvas(
                             .testTag("tool_undo_line")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Undo,
+                            imageVector = Icons.AutoMirrored.Filled.Undo,
                             contentDescription = "Undo Line",
                             tint = textColor,
                             modifier = Modifier.size(16.dp)
@@ -1280,6 +1601,50 @@ fun CandlestickChartCanvas(
                         .background(gridColor)
                 )
                 
+                Box(
+                    modifier = Modifier
+                        .height(20.dp)
+                        .width(1.dp)
+                        .background(gridColor)
+                )
+
+                // AI Redraw Overlay Toggle Button
+                IconButton(
+                    onClick = {
+                        isAiOverlayActive = !isAiOverlayActive
+                    },
+                    modifier = Modifier
+                        .size(32.dp)
+                        .background(
+                            if (isAiOverlayActive && aiOverlay != null) Color(0xFF38BDF8).copy(alpha = 0.25f) else Color.Transparent,
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        .testTag("tool_ai_overlay_toggle")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AutoAwesome,
+                        contentDescription = "Toggle AI Redraw Overlay",
+                        tint = if (isAiOverlayActive) Color(0xFF38BDF8) else textMuted,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                if (onTriggerAiRedraw != null) {
+                    IconButton(
+                        onClick = { onTriggerAiRedraw.invoke() },
+                        modifier = Modifier
+                            .size(32.dp)
+                            .testTag("tool_trigger_ai_redraw")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Trigger AI Re-draw",
+                            tint = Color(0xFF38BDF8),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+                
                 IconButton(
                     onClick = { showDebugOverlay = !showDebugOverlay },
                     modifier = Modifier
@@ -1297,10 +1662,12 @@ fun CandlestickChartCanvas(
                         modifier = Modifier.size(18.dp)
                     )
                 }
+                    }
+                } // End of AnimatedVisibility
             }
 
             // Guidance Overlay Badge when Drawing Mode is active
-            if (selectedTool != ChartDrawingTool.PAN_ZOOM) {
+            if (showOverlays && selectedTool != ChartDrawingTool.PAN_ZOOM) {
                 val hintText = when (selectedTool) {
                     ChartDrawingTool.SUPPORT -> "Tap chart to add Support Line"
                     ChartDrawingTool.RESISTANCE -> "Tap chart to add Resistance Line"
@@ -1324,9 +1691,115 @@ fun CandlestickChartCanvas(
                     )
                 }
             }
+
+            // AI Redraw Status / Live Scan Banner
+            if (showOverlays && isAiOverlayActive && (isAnalyzingAi || (aiOverlay != null && aiOverlay.pairSymbol == pair.symbol))) {
+                Surface(
+                    color = Color(0xFF0F172A).copy(alpha = 0.94f),
+                    shape = RoundedCornerShape(20.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.55f)),
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (isAnalyzingAi || aiOverlay?.isRedrawing == true) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(14.dp),
+                                color = Color(0xFF38BDF8),
+                                strokeWidth = 2.dp
+                            )
+                            Text(
+                                text = if (aiOverlay?.redrawStep?.isNotEmpty() == true) "AI REDRAWING: ${aiOverlay.redrawStep}" else "AI SCANNING & REDRAWING MARKET STRUCTURE...",
+                                color = Color(0xFF38BDF8),
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.5.sp
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.AutoAwesome,
+                                contentDescription = null,
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "AI REDRAW ACTIVE • ${aiOverlay?.zones?.size ?: 0} ZONES • ${aiOverlay?.trendlines?.size ?: 0} VECTORS • ${aiOverlay?.fibonacciLevels?.size ?: 0} FIB LEVELS",
+                                color = Color(0xFF38BDF8),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.4.sp
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Dashboard Overlay for Technical Patterns
+            if (showOverlays && indicatorSettings.showPatterns && detectedPatterns.isNotEmpty()) {
+                val recentPatterns = detectedPatterns.takeLast(2).reversed()
+                
+                Card(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(top = 56.dp, start = 12.dp)
+                        .widthIn(max = 220.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A).copy(alpha = 0.88f)),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334155))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.AutoGraph,
+                                contentDescription = null,
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "PATTERN DETECTOR",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.5.sp
+                            )
+                        }
+                        
+                        recentPatterns.forEach { pat ->
+                            val color = if (pat.patternType.isBullish) Color(0xFF10B981) else Color(0xFFEF4444)
+                            val icon = if (pat.patternType.isBullish) "📈" else "📉"
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(icon, fontSize = 14.sp)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column {
+                                    Text(
+                                        text = pat.patternType.title,
+                                        color = color,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.sp
+                                    )
+                                    Text(
+                                        text = "Candle ${pat.candleIndex} | Score: ${pat.confidence}",
+                                        color = Color.White.copy(alpha = 0.6f),
+                                        fontSize = 9.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             
             // Debug FPS and Latency Overlay
-            if (showDebugOverlay) {
+            if (showOverlays && showDebugOverlay) {
                 Surface(
                     color = bgDark.copy(alpha = 0.7f),
                     shape = RoundedCornerShape(8.dp),
@@ -1378,7 +1851,7 @@ fun CandlestickChartCanvas(
         if (indicatorSettings.showRsiSubchart) {
             Box(
                 modifier = Modifier
-                    .weight(0.25f)
+                    .weight(subChartWeight)
                     .fillMaxWidth()
                     .background(Color(0xFF020617))
             ) {
@@ -1397,28 +1870,30 @@ fun CandlestickChartCanvas(
                     val endIdx = (startIdx + visibleCount - 1).coerceIn(startIdx, candles.size - 1)
                     val candleWidth = (canvasWidth / (endIdx - startIdx + 1)).toFloat()
 
-                    // RSI Overbought (70) and Oversold (30) threshold lines
-                    val y70 = canvasHeight * (1f - (70f / 100f))
-                    val y30 = canvasHeight * (1f - (30f / 100f))
+                    // RSI Overbought and Oversold threshold lines
+                    val overbought = indicatorSettings.rsiOverbought.toFloat()
+                    val oversold = indicatorSettings.rsiOversold.toFloat()
+                    val yOverbought = canvasHeight * (1f - (overbought / 100f))
+                    val yOversold = canvasHeight * (1f - (oversold / 100f))
 
                     drawLine(
                         color = Color(0xFFEF4444).copy(alpha = 0.5f),
-                        start = Offset(0f, y70),
-                        end = Offset(canvasWidth, y70),
+                        start = Offset(0f, yOverbought),
+                        end = Offset(canvasWidth, yOverbought),
                         strokeWidth = 1f,
                         pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f))
                     )
                     drawLine(
                         color = Color(0xFF10B981).copy(alpha = 0.5f),
-                        start = Offset(0f, y30),
-                        end = Offset(canvasWidth, y30),
+                        start = Offset(0f, yOversold),
+                        end = Offset(canvasWidth, yOversold),
                         strokeWidth = 1f,
                         pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f))
                     )
 
                     drawText(
                         textMeasurer = textMeasurer,
-                        text = "RSI (14)",
+                        text = "RSI (${indicatorSettings.rsiPeriod}) [${oversold.toInt()}/${overbought.toInt()}]",
                         style = TextStyle(color = textMuted, fontSize = 9.sp),
                         topLeft = Offset(8f, 4f)
                     )
@@ -1448,17 +1923,132 @@ fun CandlestickChartCanvas(
                     )
                 }
             }
-        }
-    }
+        } // end of RSI subchart
 
-        AnimatedVisibility(
-            visible = isLoading,
-            enter = fadeIn(animationSpec = tween(200)),
-            exit = fadeOut(animationSpec = tween(250))
-        ) {
-            ChartLoadingSkeletonAnimation(symbol = pair.symbol, modifier = Modifier.fillMaxSize())
-        }
+        // MACD Sub-chart Canvas
+        if (indicatorSettings.showMacdSubchart) {
+            Box(
+                modifier = Modifier
+                    .weight(subChartWeight)
+                    .fillMaxWidth()
+                    .background(Color(0xFF030712))
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val canvasWidth = size.width
+                    val canvasHeight = size.height
+
+                    val visibleCount = (40 / scaleFactor).toInt().coerceIn(10, candles.size)
+                    val approxCandleWidth = (canvasWidth / visibleCount).coerceAtLeast(1f)
+                    val indexShift = (offsetX / approxCandleWidth).toInt()
+
+                    val maxShift = (candles.size - visibleCount).coerceAtLeast(0)
+                    val clampedShift = indexShift.coerceIn(0, maxShift)
+
+                    val startIdx = (candles.size - visibleCount - clampedShift).coerceIn(0, candles.size - 1)
+                    val endIdx = (startIdx + visibleCount - 1).coerceIn(startIdx, candles.size - 1)
+                    val candleWidth = (canvasWidth / (endIdx - startIdx + 1)).toFloat()
+
+                    // Calculate max absolute range for MACD in visible window
+                    var maxAbsVal = 0.0005
+                    for (i in startIdx..endIdx) {
+                        macdData.macdLine.getOrNull(i)?.let { maxAbsVal = kotlin.math.max(maxAbsVal, kotlin.math.abs(it)) }
+                        macdData.signalLine.getOrNull(i)?.let { maxAbsVal = kotlin.math.max(maxAbsVal, kotlin.math.abs(it)) }
+                        macdData.histogram.getOrNull(i)?.let { maxAbsVal = kotlin.math.max(maxAbsVal, kotlin.math.abs(it)) }
+                    }
+                    val macdRange = maxAbsVal * 2.2
+                    val zeroY = canvasHeight / 2f
+
+                    // Draw Zero Center Line
+                    drawLine(
+                        color = Color(0xFF475569),
+                        start = Offset(0f, zeroY),
+                        end = Offset(canvasWidth, zeroY),
+                        strokeWidth = 1f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f))
+                    )
+
+                    drawText(
+                        textMeasurer = textMeasurer,
+                        text = "MACD (${indicatorSettings.macdFastPeriod}, ${indicatorSettings.macdSlowPeriod}, ${indicatorSettings.macdSignalPeriod})",
+                        style = TextStyle(color = textMuted, fontSize = 9.sp),
+                        topLeft = Offset(8f, 4f)
+                    )
+
+                    // Draw MACD Histogram bars
+                    val barWidth = max(2f, candleWidth * 0.6f)
+                    for ((idx, candleIdx) in (startIdx..endIdx).withIndex()) {
+                        val histVal = macdData.histogram.getOrNull(candleIdx)
+                        if (histVal != null) {
+                            val xCenter = idx * candleWidth + (candleWidth / 2f)
+                            val yHist = (zeroY - (histVal / macdRange) * canvasHeight).toFloat()
+                            val barColor = if (histVal >= 0) Color(0xFF10B981) else Color(0xFFEF4444)
+                            val top = kotlin.math.min(zeroY, yHist)
+                            val height = kotlin.math.max(1.5f, kotlin.math.abs(zeroY - yHist))
+
+                            drawRect(
+                                color = barColor.copy(alpha = 0.7f),
+                                topLeft = Offset(xCenter - (barWidth / 2f), top),
+                                size = Size(barWidth, height)
+                            )
+                        }
+                    }
+
+                    // Draw MACD Line & Signal Line
+                    val macdPath = Path()
+                    val signalPath = Path()
+                    var macdStarted = false
+                    var signalStarted = false
+
+                    for ((idx, candleIdx) in (startIdx..endIdx).withIndex()) {
+                        val x = idx * candleWidth + (candleWidth / 2f)
+
+                        macdData.macdLine.getOrNull(candleIdx)?.let { mVal ->
+                            val yM = (zeroY - (mVal / macdRange) * canvasHeight).toFloat()
+                            if (!macdStarted) {
+                                macdPath.moveTo(x, yM)
+                                macdStarted = true
+                            } else {
+                                macdPath.lineTo(x, yM)
+                            }
+                        }
+
+                        macdData.signalLine.getOrNull(candleIdx)?.let { sVal ->
+                            val yS = (zeroY - (sVal / macdRange) * canvasHeight).toFloat()
+                            if (!signalStarted) {
+                                signalPath.moveTo(x, yS)
+                                signalStarted = true
+                            } else {
+                                signalPath.lineTo(x, yS)
+                            }
+                        }
+                    }
+
+                    // MACD Line (Cyan)
+                    drawPath(
+                        path = macdPath,
+                        color = Color(0xFF38BDF8),
+                        style = Stroke(width = 2f)
+                    )
+                    // Signal Line (Orange)
+                    drawPath(
+                        path = signalPath,
+                        color = Color(0xFFF97316),
+                        style = Stroke(width = 1.8f)
+                    )
+                }
+            }
+        } // end of MACD subchart
+        
+    } // end of Column
+
+    AnimatedVisibility(
+        visible = isLoading,
+        enter = fadeIn(animationSpec = tween(200)),
+        exit = fadeOut(animationSpec = tween(250))
+    ) {
+        ChartLoadingSkeletonAnimation(symbol = pair.symbol, modifier = Modifier.fillMaxSize())
     }
+} // end of Box
 
     if (isFullscreen && !isFullscreenDialog) {
         Dialog(

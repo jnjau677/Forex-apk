@@ -108,7 +108,24 @@ data class CustomAlert(
     val createdAt: Long = System.currentTimeMillis()
 )
 
+data class MacdData(
+    val macdLine: List<Double?>,
+    val signalLine: List<Double?>,
+    val histogram: List<Double?>
+)
+
+data class UserProfile(
+    val uid: String,
+    val email: String,
+    val displayName: String,
+    val photoUrl: String? = null,
+    val isAnonymous: Boolean = false,
+    val joinedAt: Long = System.currentTimeMillis(),
+    val accountTier: String = "Pro Trader"
+)
+
 data class IndicatorSettings(
+    // Visibility Toggles
     val showSma20: Boolean = false,
     val showSma50: Boolean = false,
     val showEma20: Boolean = true,
@@ -118,5 +135,146 @@ data class IndicatorSettings(
     val showSupportResistance: Boolean = true,
     val showRsiSubchart: Boolean = true,
     val showMacdSubchart: Boolean = false,
-    val showPatterns: Boolean = true
+    val showPatterns: Boolean = true,
+
+    // Configurable Parameters for Moving Averages
+    val smaPeriod1: Int = 20,
+    val smaPeriod2: Int = 50,
+    val emaPeriod1: Int = 20,
+    val emaPeriod2: Int = 50,
+    val emaPeriod3: Int = 200,
+
+    // Configurable Parameters for RSI
+    val rsiPeriod: Int = 14,
+    val rsiOverbought: Double = 70.0,
+    val rsiOversold: Double = 30.0,
+
+    // Configurable Parameters for MACD
+    val macdFastPeriod: Int = 12,
+    val macdSlowPeriod: Int = 26,
+    val macdSignalPeriod: Int = 9,
+
+    // Configurable Parameters for Bollinger Bands
+    val bollingerPeriod: Int = 20,
+    val bollingerStdDev: Double = 2.0
 )
+
+enum class WebSocketStatus(val label: String) {
+    CONNECTING("Connecting..."),
+    CONNECTED("Live WS Connected"),
+    DISCONNECTED("Disconnected"),
+    RECONNECTING("Reconnecting..."),
+    ERROR("Connection Error")
+}
+
+enum class PriceDirection {
+    UP, DOWN, NEUTRAL
+}
+
+data class MarketTick(
+    val symbol: String,
+    val price: Double,
+    val bid: Double,
+    val ask: Double,
+    val volume: Double,
+    val timestamp: Long = System.currentTimeMillis(),
+    val priceChangeDirection: PriceDirection = PriceDirection.NEUTRAL
+)
+
+data class WebSocketStats(
+    val status: WebSocketStatus,
+    val latencyMs: Long,
+    val totalTicksReceived: Long,
+    val lastTickTime: Long,
+    val activeStreamUrl: String,
+    val messageRatePerSec: Double
+)
+
+enum class AiZoneType(val title: String) {
+    DEMAND_SUPPORT("Demand / Key Support"),
+    SUPPLY_RESISTANCE("Supply / Key Resistance"),
+    BREAKOUT_ZONE("Breakout Threshold Zone")
+}
+
+data class AiZone(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val type: AiZoneType,
+    val priceTop: Double,
+    val priceBottom: Double,
+    val label: String,
+    val strength: Double = 0.85,
+    val confidence: Int = 90
+)
+
+enum class AiTrendlineType(val title: String) {
+    BULLISH_SUPPORT("Bullish Dynamic Support"),
+    BEARISH_RESISTANCE("Bearish Dynamic Resistance"),
+    ASCENDING_CHANNEL("Ascending Channel Ray"),
+    DESCENDING_CHANNEL("Descending Channel Ray"),
+    BREAKOUT_VECTOR("Breakout Vector")
+}
+
+data class AiTrendline(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val type: AiTrendlineType,
+    val candleIndex1: Int,
+    val price1: Double,
+    val candleIndex2: Int,
+    val price2: Double,
+    val label: String,
+    val isDashed: Boolean = false
+)
+
+data class AiTargetProjection(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val entryPrice: Double,
+    val stopLoss: Double,
+    val takeProfit1: Double,
+    val takeProfit2: Double,
+    val riskRewardRatio: Double,
+    val isBuy: Boolean,
+    val rationale: String
+)
+
+data class AiFibonacciLevel(
+    val ratio: Double,
+    val percentage: String,
+    val price: Double,
+    val description: String
+)
+
+data class AiChartOverlayState(
+    val pairSymbol: String,
+    val timeframe: Timeframe,
+    val zones: List<AiZone> = emptyList(),
+    val trendlines: List<AiTrendline> = emptyList(),
+    val targets: List<AiTargetProjection> = emptyList(),
+    val fibonacciLevels: List<AiFibonacciLevel> = emptyList(),
+    val fibonacciP1: Double = 0.0,
+    val fibonacciP2: Double = 0.0,
+    val detectedPatterns: List<DetectedPattern> = emptyList(),
+    val analysisSummary: String = "",
+    val timestamp: Long = System.currentTimeMillis(),
+    val isRedrawing: Boolean = false,
+    val redrawStep: String = ""
+)
+
+enum class AiChatSender {
+    USER, AI, SYSTEM
+}
+
+data class AiChatMessage(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val sender: AiChatSender,
+    val text: String,
+    val timestamp: Long = System.currentTimeMillis(),
+    val isAnalysisReport: Boolean = false,
+    val chartOverlay: AiChartOverlayState? = null,
+    val suggestedPrompts: List<String> = emptyList()
+) {
+    val isUser: Boolean get() = sender == AiChatSender.USER
+    val hasChartRedraw: Boolean get() = chartOverlay != null || isAnalysisReport
+    val actions: List<String> get() = suggestedPrompts
+}
+
+

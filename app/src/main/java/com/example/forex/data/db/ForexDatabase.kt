@@ -6,8 +6,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [SignalEntity::class, AlertEntity::class, WatchlistEntity::class, CandleEntity::class],
-    version = 2,
+    entities = [SignalEntity::class, AlertEntity::class, WatchlistEntity::class, CandleEntity::class, UserProfileEntity::class, UserSettingsEntity::class],
+    version = 3,
     exportSchema = false
 )
 abstract class ForexDatabase : RoomDatabase() {
@@ -23,7 +23,7 @@ abstract class ForexDatabase : RoomDatabase() {
                     context.applicationContext,
                     ForexDatabase::class.java,
                     "forex_analyzer_db"
-                ).fallbackToDestructiveMigration().build()
+                ).fallbackToDestructiveMigration(dropAllTables = true).build()
                 INSTANCE = instance
                 instance
             }

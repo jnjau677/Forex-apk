@@ -47,4 +47,30 @@ interface ForexDao {
     
     @Query("DELETE FROM historical_candles WHERE symbol = :symbol AND timeframe = :timeframe")
     suspend fun deleteCandles(symbol: String, timeframe: String)
+
+    // User Profile & Authentication (Secure local persistence)
+    @Query("SELECT * FROM user_profiles WHERE isLoggedIn = 1 LIMIT 1")
+    fun getActiveUserProfile(): Flow<UserProfileEntity?>
+
+    @Query("SELECT * FROM user_profiles WHERE email = :email LIMIT 1")
+    suspend fun getUserByEmail(email: String): UserProfileEntity?
+
+    @Query("SELECT * FROM user_profiles WHERE uid = :uid LIMIT 1")
+    suspend fun getUserByUid(uid: String): UserProfileEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateUser(user: UserProfileEntity)
+
+    @Query("UPDATE user_profiles SET isLoggedIn = 0")
+    suspend fun logoutAllUsers()
+
+    @Query("UPDATE user_profiles SET isLoggedIn = 1 WHERE uid = :uid")
+    suspend fun setActiveUser(uid: String)
+
+    // User Indicator Settings Persistence
+    @Query("SELECT * FROM user_settings WHERE id = 'current_settings' LIMIT 1")
+    fun getUserSettings(): Flow<UserSettingsEntity?>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun saveUserSettings(settings: UserSettingsEntity)
 }

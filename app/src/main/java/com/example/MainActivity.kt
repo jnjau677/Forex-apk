@@ -1,12 +1,18 @@
 package com.example
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ShowChart
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -21,6 +27,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.forex.data.model.TradeSignal
 import com.example.forex.ui.screens.*
 import com.example.forex.ui.viewmodel.ForexViewModel
+import com.example.forex.worker.scheduleSignalWorker
 import com.example.ui.theme.MyApplicationTheme
 
 enum class ForexAppTab(
@@ -29,7 +36,7 @@ enum class ForexAppTab(
     val unselectedIcon: ImageVector,
     val testTag: String
 ) {
-    TERMINAL("Terminal", Icons.Filled.ShowChart, Icons.Outlined.ShowChart, "nav_tab_terminal"),
+    TERMINAL("Terminal", Icons.AutoMirrored.Filled.ShowChart, Icons.AutoMirrored.Filled.ShowChart, "nav_tab_terminal"),
     WATCHLIST("Watchlist", Icons.Filled.Star, Icons.Outlined.StarOutline, "nav_tab_watchlist"),
     SIGNALS("Signals", Icons.Filled.ElectricBolt, Icons.Outlined.ElectricBolt, "nav_tab_signals"),
     ALERTS("Alerts", Icons.Filled.NotificationsActive, Icons.Outlined.NotificationsActive, "nav_tab_alerts"),
@@ -41,6 +48,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+            }
+        }
+
+        scheduleSignalWorker(this)
+
         setContent {
             val viewModel: ForexViewModel = viewModel()
             val isDarkTheme by viewModel.isDarkTheme.collectAsState()

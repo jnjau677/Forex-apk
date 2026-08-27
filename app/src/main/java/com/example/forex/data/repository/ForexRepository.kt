@@ -2,16 +2,21 @@ package com.example.forex.data.repository
 
 import com.example.forex.data.db.*
 import com.example.forex.data.model.*
+import com.example.forex.data.websocket.ForexWebSocketManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.round
 import kotlin.random.Random
 
@@ -22,6 +27,12 @@ class ForexRepository(private val forexDao: ForexDao) {
     val pairs: StateFlow<List<CurrencyPair>> = _pairs.asStateFlow()
 
     private val candleMap = mutableMapOf<Pair<String, Timeframe>, MutableList<CandleStick>>()
+
+    // Real-time WebSocket Stream Manager
+    val webSocketManager = ForexWebSocketManager()
+    val webSocketStats: StateFlow<WebSocketStats> = webSocketManager.webSocketStats
+    val webSocketStatus: StateFlow<WebSocketStatus> = webSocketManager.webSocketStatus
+    val marketTicks: SharedFlow<MarketTick> = webSocketManager.marketTicks
 
     init {
         // Initialize candle history
@@ -44,7 +55,80 @@ class ForexRepository(private val forexDao: ForexDao) {
                 }
             }
         }
+
+        // Real-time WebSocket Market Tick Consumer
+        repoScope.launch {
+            webSocketManager.marketTicks.collect { tick ->
+                applyMarketTick(tick)
+            }
+        }
     }
+
+    /**
+     * Applies a live market tick from WebSocket directly to currency pairs and active candles.
+     */
+    private fun applyMarketTick(tick: MarketTick) {
+        val currentList = _pairs.value
+        var pairFound = false
+
+        val updatedList = currentList.map { pair ->
+            if (pair.symbol == tick.symbol) {
+                pairFound = true
+                val newPrice = tick.price
+                val newHigh = max(pair.high24h, newPrice)
+                val newLow = min(pair.low24h, newPrice)
+
+                // Update latest candle for all timeframes
+                val now = tick.timestamp
+                Timeframe.values().forEach { tf ->
+                    val key = Pair(pair.symbol, tf)
+                    val candles = candleMap[key]
+                    if (candles != null && candles.isNotEmpty()) {
+                        val lastCandle = candles.last()
+                        val tfMillis = tf.minutes * 60 * 1000L
+
+                        // If candle period elapsed, start a new candle
+                        if (now - lastCandle.timestamp >= tfMillis) {
+                            val newCandle = CandleStick(
+                                timestamp = (now / tfMillis) * tfMillis,
+                                open = newPrice,
+                                high = newPrice,
+                                low = newPrice,
+                                close = newPrice,
+                                volume = tick.volume
+                            )
+                            candles.add(newCandle)
+                            if (candles.size > 150) {
+                                candles.removeAt(0)
+                            }
+                        } else {
+                            // Update active candle with new high/low/close and accumulate volume
+                            val updatedLast = lastCandle.copy(
+                                close = newPrice,
+                                high = max(lastCandle.high, newPrice),
+                                low = min(lastCandle.low, newPrice),
+                                volume = lastCandle.volume + tick.volume
+                            )
+                            candles[candles.lastIndex] = updatedLast
+                        }
+                    }
+                }
+
+                pair.copy(
+                    currentPrice = newPrice,
+                    high24h = newHigh,
+                    low24h = newLow
+                )
+            } else {
+                pair
+            }
+        }
+
+        if (pairFound) {
+            _pairs.value = updatedList
+        }
+    }
+
 
     private fun createInitialPairs(): List<CurrencyPair> {
         return listOf(
@@ -90,7 +174,42 @@ class ForexRepository(private val forexDao: ForexDao) {
             val price = pair?.currentPrice ?: 1.0
             val generated = generateInitialCandles(price, timeframe)
             candleMap[key] = generated
+            
             repoScope.launch {
+                if (marketDataService.isConfigured()) {
+                    val tfStr = when (timeframe) {
+                        Timeframe.M1 -> "1m"
+                        Timeframe.M5 -> "5m"
+                        Timeframe.M15 -> "15m"
+                        Timeframe.H1 -> "1h"
+                        Timeframe.H4 -> "4h"
+                        Timeframe.D1 -> "1d"
+                    }
+                    val apiSymbol = symbol.replace("/", "")
+                    val result = marketDataService.fetchHistoricalCandles(apiSymbol, tfStr)
+                    if (result.isSuccess) {
+                        val networkCandles = result.getOrNull()?.map { c ->
+                            CandleStick(
+                                timestamp = c.t?.toLongOrNull()?.times(1000) ?: System.currentTimeMillis(),
+                                open = c.o?.toDoubleOrNull() ?: price,
+                                high = c.h?.toDoubleOrNull() ?: price,
+                                low = c.l?.toDoubleOrNull() ?: price,
+                                close = c.c?.toDoubleOrNull() ?: price,
+                                volume = c.v?.toDoubleOrNull() ?: 1000.0
+                            )
+                        }?.sortedBy { it.timestamp }
+                        if (networkCandles != null && networkCandles.isNotEmpty()) {
+                            candleMap[key] = networkCandles.toMutableList()
+                            forexDao.insertCandles(networkCandles.map {
+                                CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
+                            })
+                            // Trigger UI update
+                            _pairs.value = _pairs.value.toList()
+                            return@launch
+                        }
+                    }
+                }
+                
                 forexDao.insertCandles(generated.map {
                     CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
                 })
@@ -160,7 +279,7 @@ class ForexRepository(private val forexDao: ForexDao) {
             }
 
             val request = OpenRouterRequest(
-                model = "google/gemini-2.5-flash",
+                model = "mistralai/mistral-large",
                 messages = listOf(OpenRouterMessage(role = "user", content = prompt))
             )
 
@@ -183,105 +302,18 @@ class ForexRepository(private val forexDao: ForexDao) {
 
 
     /**
-     * Real-time tick stream: Updates currency prices & current candle
+     * Real-time tick stream: Emits real-time pair state driven by WebSocket ticks
      */
-    fun startLivePriceStream() = flow {
-        val useRealApi = marketDataService.isConfigured()
+    fun startLivePriceStream(): Flow<List<CurrencyPair>> = _pairs.asStateFlow()
 
-        while (true) {
-            delay(5000) // Update every 5 seconds to avoid rate limiting
-            
-            val updatedPairs = if (useRealApi) {
-                val symbols = _pairs.value.map { it.symbol }
-                val result = marketDataService.fetchLatestPrices(symbols)
-                
-                if (result.isSuccess) {
-                    val prices = result.getOrDefault(emptyList())
-                    _pairs.value.map { pair ->
-                        val latestInfo = prices.find { it.s == pair.symbol || it.s == pair.symbol.replace("/", "") }
-                        if (latestInfo != null) {
-                            val newPrice = latestInfo.c.toDoubleOrNull() ?: pair.currentPrice
-                            val newHigh = maxOf(pair.high24h, newPrice)
-                            val newLow = minOf(pair.low24h, newPrice)
-                            
-                            // Update latest candle for all timeframes
-                            Timeframe.values().forEach { tf ->
-                                val key = Pair(pair.symbol, tf)
-                                val candles = candleMap[key]
-                                if (candles != null && candles.isNotEmpty()) {
-                                    val lastCandle = candles.last()
-                                    val updatedLast = lastCandle.copy(
-                                        close = newPrice,
-                                        high = maxOf(lastCandle.high, newPrice),
-                                        low = minOf(lastCandle.low, newPrice),
-                                        volume = lastCandle.volume + Random.nextDouble(1.0, 10.0)
-                                    )
-                                    candles[candles.lastIndex] = updatedLast
-                                }
-                            }
-                            
-                            pair.copy(
-                                currentPrice = newPrice,
-                                high24h = newHigh,
-                                low24h = newLow
-                            )
-                        } else {
-                            pair
-                        }
-                    }
-                } else {
-                    _pairs.value
-                }
-            } else {
-                // Simulated data fallback
-                _pairs.value.map { pair ->
-                    val pipChange = if (pair.symbol.contains("JPY")) {
-                        Random.nextDouble(-0.08, 0.08)
-                    } else if (pair.symbol == "XAU/USD") {
-                        Random.nextDouble(-1.2, 1.2)
-                    } else if (pair.symbol == "BTC/USD") {
-                        Random.nextDouble(-45.0, 45.0)
-                    } else {
-                        Random.nextDouble(-0.0003, 0.0003)
-                    }
-
-                    val newPrice = (pair.currentPrice + pipChange).let {
-                        if (pair.pipSize == 0.0001) round(it * 10000) / 10000.0
-                        else if (pair.pipSize == 0.01) round(it * 100) / 100.0
-                        else round(it * 10) / 10.0
-                    }
-
-                    val newHigh = maxOf(pair.high24h, newPrice)
-                    val newLow = minOf(pair.low24h, newPrice)
-
-                    // Update latest candle for all timeframes
-                    Timeframe.values().forEach { tf ->
-                        val key = Pair(pair.symbol, tf)
-                        val candles = candleMap[key]
-                        if (candles != null && candles.isNotEmpty()) {
-                            val lastCandle = candles.last()
-                            val updatedLast = lastCandle.copy(
-                                close = newPrice,
-                                high = maxOf(lastCandle.high, newPrice),
-                                low = minOf(lastCandle.low, newPrice),
-                                volume = lastCandle.volume + Random.nextDouble(5.0, 25.0)
-                            )
-                            candles[candles.lastIndex] = updatedLast
-                        }
-                    }
-
-                    pair.copy(
-                        currentPrice = newPrice,
-                        high24h = newHigh,
-                        low24h = newLow
-                    )
-                }
-            }
-
-            _pairs.value = updatedPairs
-            emit(updatedPairs)
-        }
+    fun reconnectWebSocket() {
+        webSocketManager.reconnect()
     }
+
+    fun disconnectWebSocket() {
+        webSocketManager.disconnect()
+    }
+
 
     // Room DB methods
     val savedSignals: Flow<List<SignalEntity>> = forexDao.getAllSavedSignals()
@@ -340,5 +372,67 @@ class ForexRepository(private val forexDao: ForexDao) {
 
     suspend fun removeFromWatchlist(symbol: String) {
         forexDao.removeFromWatchlist(symbol)
+    }
+
+    // Indicator Settings Persistence
+    val savedIndicatorSettings: Flow<IndicatorSettings?> = forexDao.getUserSettings().map { entity ->
+        entity?.let {
+            IndicatorSettings(
+                showSma20 = it.showSma20,
+                showSma50 = it.showSma50,
+                showEma20 = it.showEma20,
+                showEma50 = it.showEma50,
+                showEma200 = it.showEma200,
+                showBollingerBands = it.showBollingerBands,
+                showSupportResistance = it.showSupportResistance,
+                showRsiSubchart = it.showRsiSubchart,
+                showMacdSubchart = it.showMacdSubchart,
+                showPatterns = it.showPatterns,
+                smaPeriod1 = it.smaPeriod1,
+                smaPeriod2 = it.smaPeriod2,
+                emaPeriod1 = it.emaPeriod1,
+                emaPeriod2 = it.emaPeriod2,
+                emaPeriod3 = it.emaPeriod3,
+                rsiPeriod = it.rsiPeriod,
+                rsiOverbought = it.rsiOverbought,
+                rsiOversold = it.rsiOversold,
+                macdFastPeriod = it.macdFastPeriod,
+                macdSlowPeriod = it.macdSlowPeriod,
+                macdSignalPeriod = it.macdSignalPeriod,
+                bollingerPeriod = it.bollingerPeriod,
+                bollingerStdDev = it.bollingerStdDev
+            )
+        }
+    }
+
+    suspend fun saveIndicatorSettings(settings: IndicatorSettings) {
+        forexDao.saveUserSettings(
+            UserSettingsEntity(
+                id = "current_settings",
+                showSma20 = settings.showSma20,
+                showSma50 = settings.showSma50,
+                showEma20 = settings.showEma20,
+                showEma50 = settings.showEma50,
+                showEma200 = settings.showEma200,
+                showBollingerBands = settings.showBollingerBands,
+                showSupportResistance = settings.showSupportResistance,
+                showRsiSubchart = settings.showRsiSubchart,
+                showMacdSubchart = settings.showMacdSubchart,
+                showPatterns = settings.showPatterns,
+                smaPeriod1 = settings.smaPeriod1,
+                smaPeriod2 = settings.smaPeriod2,
+                emaPeriod1 = settings.emaPeriod1,
+                emaPeriod2 = settings.emaPeriod2,
+                emaPeriod3 = settings.emaPeriod3,
+                rsiPeriod = settings.rsiPeriod,
+                rsiOverbought = settings.rsiOverbought,
+                rsiOversold = settings.rsiOversold,
+                macdFastPeriod = settings.macdFastPeriod,
+                macdSlowPeriod = settings.macdSlowPeriod,
+                macdSignalPeriod = settings.macdSignalPeriod,
+                bollingerPeriod = settings.bollingerPeriod,
+                bollingerStdDev = settings.bollingerStdDev
+            )
+        )
     }
 }

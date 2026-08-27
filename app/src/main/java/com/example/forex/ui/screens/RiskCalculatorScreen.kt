@@ -188,7 +188,7 @@ fun RiskCalculatorScreen(
                     MetricColumn("MICRO LOTS", String.format(Locale.US, "%.0f", microLots), Color(0xFFF59E0B))
                 }
 
-                Divider(color = Color(0xFF1E293B))
+                HorizontalDivider(color = Color(0xFF1E293B))
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),

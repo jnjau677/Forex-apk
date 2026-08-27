@@ -12,6 +12,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ShowChart
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -88,18 +89,21 @@ fun LiveTickerHeader(
     pair: CurrencyPair,
     selectedTimeframe: Timeframe,
     onTimeframeSelected: (Timeframe) -> Unit,
+    webSocketStats: WebSocketStats? = null,
+    onReconnectWebSocket: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val isPositive = pair.priceChange24h >= 0
     val changeColor = if (isPositive) Color(0xFF10B981) else Color(0xFFEF4444)
+    var showWsDialog by remember { mutableStateOf(false) }
 
-    // Pulse animation for live prices
+    // Pulse animation for live prices and WebSocket ticks
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.3f,
+        initialValue = 0.35f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
-            animation = tween(800, easing = LinearEasing),
+            animation = tween(600, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse
         ),
         label = "alpha"
@@ -109,7 +113,7 @@ fun LiveTickerHeader(
         modifier = modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.background)
-            .padding(16.dp)
+            .padding(horizontal = 16.dp, vertical = 10.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -145,6 +149,44 @@ fun LiveTickerHeader(
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                         )
                     }
+
+                    // Real-time WebSocket Status Pill
+                    if (webSocketStats != null) {
+                        val statusColor = when (webSocketStats.status) {
+                            WebSocketStatus.CONNECTED -> Color(0xFF10B981)
+                            WebSocketStatus.CONNECTING, WebSocketStatus.RECONNECTING -> Color(0xFFF59E0B)
+                            WebSocketStatus.DISCONNECTED, WebSocketStatus.ERROR -> Color(0xFFEF4444)
+                        }
+
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = statusColor.copy(alpha = 0.15f),
+                            border = BorderStroke(1.dp, statusColor.copy(alpha = 0.5f)),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { showWsDialog = true }
+                                .testTag("ws_status_chip")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(statusColor)
+                                )
+                                Text(
+                                    text = if (webSocketStats.status == WebSocketStatus.CONNECTED) "${webSocketStats.latencyMs}ms" else webSocketStats.status.label,
+                                    color = statusColor,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
                 }
                 Text(
                     text = pair.name,
@@ -168,39 +210,158 @@ fun LiveTickerHeader(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // Timeframe selector buttons
+        // Timeframe Selector and Quick Ticker Meta
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Timeframe.values().forEach { tf ->
-                val isSelected = tf == selectedTimeframe
-                Surface(
-                    onClick = { onTimeframeSelected(tf) },
-                    shape = RoundedCornerShape(8.dp),
-                    color = if (isSelected) Color(0xFF38BDF8) else MaterialTheme.colorScheme.surface,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("tf_button_${tf.name}")
+            // Timeframe Dropdown
+            var expanded by remember { mutableStateOf(false) }
+            Box {
+                OutlinedButton(
+                    onClick = { expanded = true },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                    modifier = Modifier.height(34.dp).testTag("tf_dropdown_btn")
                 ) {
-                    Box(
-                        modifier = Modifier.padding(vertical = 6.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = tf.label,
-                            color = if (isSelected) MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.onBackground,
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                            fontSize = 12.sp
+                    Text(text = "TF: ${selectedTimeframe.label}", fontSize = 12.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.Default.ArrowDropDown, contentDescription = "Select Timeframe", modifier = Modifier.size(16.dp))
+                }
+                DropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false }
+                ) {
+                    Timeframe.values().forEach { tf ->
+                        DropdownMenuItem(
+                            text = { Text(tf.label, fontWeight = if (tf == selectedTimeframe) FontWeight.Bold else FontWeight.Normal) },
+                            onClick = {
+                                onTimeframeSelected(tf)
+                                expanded = false
+                            }
                         )
                     }
                 }
             }
+
+            // Quick live micro-spread indicator
+            if (webSocketStats != null && webSocketStats.status == WebSocketStatus.CONNECTED) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "LIVE TICKS: ${webSocketStats.totalTicksReceived}",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
         }
     }
+
+    if (showWsDialog && webSocketStats != null) {
+        WebSocketInfoDialog(
+            stats = webSocketStats,
+            onReconnect = {
+                onReconnectWebSocket()
+                showWsDialog = false
+            },
+            onDismiss = { showWsDialog = false }
+        )
+    }
 }
+
+@Composable
+fun WebSocketInfoDialog(
+    stats: WebSocketStats,
+    onReconnect: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Bolt,
+                    contentDescription = null,
+                    tint = Color(0xFF10B981)
+                )
+                Text("Live WebSocket Stream", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            }
+        },
+        text = {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Connection State", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                stats.status.label,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (stats.status == WebSocketStatus.CONNECTED) Color(0xFF10B981) else Color(0xFFEF4444)
+                            )
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Latency / Ping", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${stats.latencyMs} ms", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Total Ticks Received", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${stats.totalTicksReceived}", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground)
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Throughput", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${stats.messageRatePerSec} msg/sec", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                        }
+
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                        Text("Stream Endpoint:", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(
+                            text = stats.activeStreamUrl,
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onReconnect,
+                modifier = Modifier.testTag("dialog_reconnect_ws_btn")
+            ) {
+                Text("Reconnect Stream")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
+}
+
 
 @Composable
 fun SignalCard(
@@ -343,7 +504,7 @@ fun SignalCard(
                     .fillMaxWidth()
                     .testTag("inspect_signal_${signal.id}")
             ) {
-                Icon(Icons.Default.ShowChart, contentDescription = null, modifier = Modifier.size(16.dp))
+                Icon(Icons.AutoMirrored.Filled.ShowChart, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Inspect Targets on Live Chart", color = MaterialTheme.colorScheme.onBackground, fontSize = 12.sp)
             }

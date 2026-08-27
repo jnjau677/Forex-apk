@@ -1,16 +1,42 @@
 package com.example
 
+import com.example.forex.data.model.CurrencyPair
+import com.example.forex.data.model.Timeframe
+import com.example.forex.data.repository.PriceGenerator
+import com.example.forex.data.repository.TechnicalAnalysisEngine
 import org.junit.Assert.*
 import org.junit.Test
 
-/**
- * Example local unit test, which will execute on the development machine (host).
- *
- * See [testing documentation](http://d.android.com/tools/testing).
- */
 class ExampleUnitTest {
   @Test
   fun addition_isCorrect() {
     assertEquals(4, 2 + 2)
+  }
+
+  @Test
+  fun testAiChartOverlayGeneration() {
+    val pair = CurrencyPair(symbol = "EUR/USD", basePrice = 1.0850, currentPrice = 1.0865, dailyChangePercent = 0.45)
+    val candles = PriceGenerator.generateCandles(basePrice = 1.0850, count = 100, timeframe = Timeframe.H1)
+    
+    val overlay = TechnicalAnalysisEngine.generateAiChartOverlay(pair, candles, Timeframe.H1)
+    
+    assertNotNull(overlay)
+    assertEquals("EUR/USD", overlay.pairSymbol)
+    assertTrue("Should generate AI demand/supply zones", overlay.zones.isNotEmpty())
+    assertTrue("Should generate AI Fibonacci levels", overlay.fibonacciLevels.isNotEmpty())
+    assertTrue("Should compute Fibonacci levels with valid prices", overlay.fibonacciLevels.all { it.price > 0 })
+    assertTrue("Fibonacci levels count should cover standard ratios", overlay.fibonacciLevels.size >= 5)
+  }
+
+  @Test
+  fun testTradeSignalGeneration() {
+    val pair = CurrencyPair(symbol = "GBP/USD", basePrice = 1.2700, currentPrice = 1.2720, dailyChangePercent = 0.20)
+    val candles = PriceGenerator.generateCandles(basePrice = 1.2700, count = 100, timeframe = Timeframe.H1)
+    
+    val signal = TechnicalAnalysisEngine.generateTradeSignal(pair, candles, Timeframe.H1)
+    assertNotNull(signal)
+    assertTrue("Signal confidence should be between 0 and 100", signal.confidence in 0..100)
+    assertTrue("Stop loss should be positive", signal.stopLoss > 0)
+    assertTrue("Take profit should be positive", signal.takeProfit > 0)
   }
 }
