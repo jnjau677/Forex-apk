@@ -17,7 +17,14 @@ data class SignalEntity(
     val timeframeLabel: String,
     val summaryRationale: String,
     val timestamp: Long,
-    val isBookmarked: Boolean = true
+    val isBookmarked: Boolean = true,
+    // Volatility-aware metadata (added with the ATR sizing upgrade; schema v4)
+    val atrValue: Double = 0.0,
+    val stopLossPips: Double = 0.0,
+    val volatilityRegime: String = "NORMAL",
+    val suggestedLotSize: Double = 0.0,
+    val dataQualityScore: Int = 100,
+    val dataSource: String = "SIMULATION"
 )
 
 @Entity(tableName = "custom_alerts")

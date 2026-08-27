@@ -12,8 +12,15 @@ interface ForexDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSignal(signal: SignalEntity)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSignals(signals: List<SignalEntity>)
+
     @Query("DELETE FROM saved_signals WHERE id = :signalId")
     suspend fun deleteSignal(signalId: String)
+
+    /** Recent saved signals — used by SignalWorker for notification de-duplication. */
+    @Query("SELECT * FROM saved_signals WHERE timestamp >= :sinceTimestamp ORDER BY timestamp DESC")
+    suspend fun getSignalsSince(sinceTimestamp: Long): List<SignalEntity>
 
     // Custom Alerts
     @Query("SELECT * FROM custom_alerts ORDER BY createdAt DESC")

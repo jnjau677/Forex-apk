@@ -4,16 +4,16 @@ import android.app.Application
 import android.graphics.Bitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.forex.data.ai.DynamicAiResponseEngine
 import com.example.forex.data.db.ForexDatabase
 import com.example.forex.data.model.*
+import com.example.forex.data.remote.MarketDataHealth
 import com.example.forex.data.repository.ForexRepository
 import com.example.forex.data.repository.TechnicalAnalysisEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlin.math.round
-import java.util.Locale
 import com.example.forex.data.auth.ForexAuthManager
 import com.example.forex.data.auth.GoogleAuthClient
 import com.google.firebase.auth.FirebaseUser
@@ -222,6 +222,9 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
     val webSocketStatus: StateFlow<WebSocketStatus> = repository.webSocketStatus
     val marketTicks: SharedFlow<MarketTick> = repository.marketTicks
 
+    /** Health of the real REST market data chain (Alpha Vantage -> FCS -> simulation). */
+    val marketDataHealth: StateFlow<MarketDataHealth> = repository.marketDataHealth
+
     private val _candleVersion = MutableStateFlow(0L)
     val candleVersion: StateFlow<Long> = _candleVersion.asStateFlow()
 
@@ -284,9 +287,58 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
     private fun generateAllSignals(currentPairs: List<CurrencyPair>) {
         val signals = currentPairs.map { pair ->
             val candles = repository.getCandles(pair.symbol, _selectedTimeframe.value)
-            TechnicalAnalysisEngine.generateTradeSignal(pair, candles, _selectedTimeframe.value)
+            TechnicalAnalysisEngine.generateTradeSignal(pair, candles, _selectedTimeframe.value, _indicatorSettings.value)
         }
         _liveSignals.value = signals
+    }
+
+    /**
+     * Pull fresh market data for the selected symbol: validated candle history via the
+     * Alpha Vantage -> FCS chain (force refresh) plus a realtime spot quote, then rebuilds
+     * signals across all pairs. Falls back silently to cached Room history offline.
+     */
+    fun refreshMarketData() {
+        viewModelScope.launch(Dispatchers.Default) {
+            triggerChartLoading(650)
+            repository.refreshMarketSnapshot(_selectedPair.value.symbol, _selectedTimeframe.value)
+            repository.refreshLatestQuoteFor(_selectedPair.value.symbol)
+            generateAllSignals(pairs.value)
+        }
+    }
+
+    private fun parentTrendAlignment(currentTf: Timeframe): List<Pair<String, String>> {
+        val all = Timeframe.values().toList()
+        val idx = all.indexOf(currentTf)
+        if (idx < 0) return emptyList()
+        val out = mutableListOf<Pair<String, String>>()
+        for (higher in all.drop(idx + 1).take(2)) {
+            val candles = repository.getCandles(_selectedPair.value.symbol, higher)
+            if (candles.size >= 55) {
+                val closes = candles.map { it.close }
+                val fast = TechnicalAnalysisEngine.calculateEMA(closes, _indicatorSettings.value.emaPeriod1).lastOrNull { it != null }
+                val slow = TechnicalAnalysisEngine.calculateEMA(closes, _indicatorSettings.value.emaPeriod2).lastOrNull { it != null }
+                if (fast != null && slow != null) {
+                    out += higher.label to if (fast > slow) "Bullish" else "Bearish"
+                }
+            }
+        }
+        return out
+    }
+
+    private fun activeOverlayNames(): String {
+        val settings = _indicatorSettings.value
+        val overlays = mutableListOf<String>()
+        if (settings.showSma20) overlays.add("SMA ${settings.smaPeriod1}")
+        if (settings.showSma50) overlays.add("SMA ${settings.smaPeriod2}")
+        if (settings.showEma20) overlays.add("EMA ${settings.emaPeriod1}")
+        if (settings.showEma50) overlays.add("EMA ${settings.emaPeriod2}")
+        if (settings.showEma200) overlays.add("EMA ${settings.emaPeriod3}")
+        if (settings.showBollingerBands) overlays.add("Bollinger Bands")
+        if (settings.showSupportResistance) overlays.add("Support/Resistance")
+        if (settings.showRsiSubchart) overlays.add("RSI (${settings.rsiPeriod})")
+        if (settings.showMacdSubchart) overlays.add("MACD")
+        if (settings.showPatterns) overlays.add("Pattern Markers")
+        return overlays.joinToString(", ").ifEmpty { "Clean Candlesticks" }
     }
 
     fun triggerChartLoading(durationMs: Long = 450) {
@@ -406,9 +458,20 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Chat entry point for the AI analyst.
+     *
+     * The reply is never a canned paragraph: every turn re-reads the live candles for the
+     * selected pair/timeframe, recomputes the full indicator stack (EMA/RSI/MACD/ADX/Bollinger/
+     * ATR + volatility sizing) into a [DynamicAiResponseEngine.MarketAnalysisContext], detects
+     * the user's intent, optionally redraws the chart overlay from the same candles, then asks
+     * OpenRouter to answer the question grounded in the deterministic fact sheet. If the LLM
+     * is not configured (or fails), the dynamic local engine composes the answer from the same
+     * numbers — so the response always reflects current data, in either mode.
+     */
     fun sendAiChatMessage(userText: String, requestedRedrawType: String? = null) {
         if (userText.isBlank()) return
-        
+
         val userMsg = AiChatMessage(
             sender = AiChatSender.USER,
             text = userText.trim()
@@ -417,152 +480,103 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             _isAnalyzingAi.value = true
-            val pair = _selectedPair.value
-            val tf = _selectedTimeframe.value
-            val candles = getCandlesForSelectedPair()
-            val signal = TechnicalAnalysisEngine.generateTradeSignal(pair, candles, tf)
-            val patterns = TechnicalAnalysisEngine.detectPatterns(candles)
-            val patternNames = patterns.joinToString(", ") { it.patternType.title }.ifEmpty { "Consolidation" }
-
-            var overlayResult: AiChartOverlayState? = null
-
-            // If auto-redraw is enabled or prompt requests chart redraw
-            val shouldRedraw = _aiAutoRedrawEnabled.value || 
-                userText.contains("redraw", ignoreCase = true) || 
-                userText.contains("draw", ignoreCase = true) || 
-                userText.contains("zone", ignoreCase = true) || 
-                userText.contains("trend", ignoreCase = true) || 
-                userText.contains("fib", ignoreCase = true) || 
-                userText.contains("target", ignoreCase = true)
-
-            if (shouldRedraw) {
-                _aiRedrawStep.value = "AI analyzing ${pair.symbol} structure..."
-                _aiChartOverlay.value = (_aiChartOverlay.value ?: AiChartOverlayState(pair.symbol, tf)).copy(
-                    isRedrawing = true,
-                    redrawStep = "Scanning extremes on ${tf.label}..."
+            try {
+                val pair = _selectedPair.value
+                val tf = _selectedTimeframe.value
+                val settings = _indicatorSettings.value
+                val candles = getCandlesForSelectedPair()
+                val ctx = DynamicAiResponseEngine.buildContext(
+                    pair = pair,
+                    candles = candles,
+                    timeframe = tf,
+                    settings = settings,
+                    parentTrends = parentTrendAlignment(tf)
                 )
-                delay(300)
+                val intent = DynamicAiResponseEngine.detectIntent(userText, requestedRedrawType)
 
-                _aiRedrawStep.value = "Generating AI zones & vectors..."
-                delay(300)
+                var overlayResult = _aiChartOverlay.value
+                    ?.takeIf { it.pairSymbol == pair.symbol && it.timeframe == tf }
 
-                overlayResult = TechnicalAnalysisEngine.generateAiChartOverlay(pair, candles, tf, requestedRedrawType)
-                _aiChartOverlay.value = overlayResult.copy(isRedrawing = false)
-                _showAiDrawingsOnChart.value = true
-                _aiRedrawStep.value = ""
+                if (DynamicAiResponseEngine.shouldRedrawChart(userText, _aiAutoRedrawEnabled.value, intent)) {
+                    _aiRedrawStep.value = "AI analyzing ${pair.symbol} structure..."
+                    _aiChartOverlay.value = (overlayResult ?: AiChartOverlayState(pair.symbol, tf)).copy(
+                        isRedrawing = true,
+                        redrawStep = "Recomputing pivots & ATR bands on ${tf.label}..."
+                    )
+                    delay(220)
+                    overlayResult = TechnicalAnalysisEngine.generateAiChartOverlay(pair, candles, tf, requestedRedrawType)
+                    _aiChartOverlay.value = overlayResult.copy(
+                        isRedrawing = false,
+                        redrawStep = "Chart redrawn from ${candles.size} validated candles"
+                    )
+                    _showAiDrawingsOnChart.value = true
+                    _aiRedrawStep.value = ""
+                }
+
+                val patternNames = ctx.patterns.joinToString(", ") { it.patternType.title }
+                    .ifEmpty { "Consolidation" }
+
+                val llmAnswer = repository.fetchOpenRouterAnalysis(
+                    symbol = pair.symbol,
+                    timeframe = tf.label,
+                    currentPrice = pair.currentPrice,
+                    signalType = ctx.signal.type.title,
+                    rsiValue = ctx.signal.rsiValue,
+                    patterns = patternNames,
+                    isSnapshotAnalysis = false,
+                    activeOverlays = activeOverlayNames(),
+                    userQuestion = userText,
+                    quantitativeContext = DynamicAiResponseEngine.quantitativeFactSheet(ctx)
+                )
+
+                val answer = llmAnswer ?: DynamicAiResponseEngine.compose(ctx, intent, userText)
+
+                // Perception: pacing scales with content length instead of fixed fake waits.
+                delay((answer.length / 40L).coerceIn(80L, 550L))
+
+                val aiResponse = AiChatMessage(
+                    sender = AiChatSender.AI,
+                    text = answer,
+                    chartOverlay = overlayResult,
+                    suggestedPrompts = DynamicAiResponseEngine.followUpPrompts(intent)
+                )
+                _aiChatMessages.value = _aiChatMessages.value + aiResponse
+                _aiReport.value = answer
+            } finally {
+                _isAnalyzingAi.value = false
             }
-
-            // Generate AI text response
-            val responseTextBuilder = StringBuilder()
-            val lower = userText.lowercase()
-
-            if (lower.contains("fib") || requestedRedrawType == "FIBONACCI") {
-                val fib = overlayResult?.fibonacciLevels ?: emptyList()
-                responseTextBuilder.append("📐 **AI FIBONACCI RETRACEMENT REDRAW (${pair.symbol} - ${tf.label})**\n\n")
-                responseTextBuilder.append("I have identified the primary impulse wave and redrawn key Golden Ratio levels on your chart:\n\n")
-                fib.forEach { f ->
-                    responseTextBuilder.append("• **${f.percentage}** (${f.description}): `${String.format(Locale.US, "%.5f", f.price)}`\n")
-                }
-                responseTextBuilder.append("\n💡 **Tactical Recommendation:** Watch for buying reactions at the **61.8% Golden Pocket Zone** with bullish candle confirmations.")
-            } else if (lower.contains("support") || lower.contains("resistance") || lower.contains("zone") || requestedRedrawType == "ZONES") {
-                val zones = overlayResult?.zones ?: emptyList()
-                responseTextBuilder.append("🪄 **AI SUPPLY & DEMAND ZONES REDRAW (${pair.symbol} - ${tf.label})**\n\n")
-                responseTextBuilder.append("I scanned historical liquidity clusters and redrawn institutional zones directly on the canvas:\n\n")
-                zones.forEach { z ->
-                    val colorTag = if (z.type == AiZoneType.DEMAND_SUPPORT) "🟢" else if (z.type == AiZoneType.SUPPLY_RESISTANCE) "🔴" else "🟡"
-                    responseTextBuilder.append("$colorTag **${z.label}**\n   Range: `${String.format(Locale.US, "%.5f", z.priceBottom)} - ${String.format(Locale.US, "%.5f", z.priceTop)}` (Confidence: ${z.confidence}%)\n\n")
-                }
-                responseTextBuilder.append("💡 **Order Flow Bias:** Current price is trading at `${pair.currentPrice}`, respecting the nearest institutional zone.")
-            } else if (lower.contains("trend") || lower.contains("channel") || requestedRedrawType == "TRENDLINES") {
-                val lines = overlayResult?.trendlines ?: emptyList()
-                responseTextBuilder.append("📈 **AI DYNAMIC TRENDLINES & CHANNEL REDRAW**\n\n")
-                responseTextBuilder.append("I analyzed multi-candle pivot structures and redrawn dynamic trend vectors on your chart:\n\n")
-                if (lines.isNotEmpty()) {
-                    lines.forEach { l ->
-                        responseTextBuilder.append("• 🔹 **${l.label}** connecting pivot at `${String.format(Locale.US, "%.5f", l.price1)}` to `${String.format(Locale.US, "%.5f", l.price2)}`\n")
-                    }
-                } else {
-                    responseTextBuilder.append("• Dynamic trendline vectors active across current session range.\n")
-                }
-                responseTextBuilder.append("\n💡 **Confluence:** Trend structure aligns with ${signal.summaryRationale}.")
-            } else if (lower.contains("target") || lower.contains("sl") || lower.contains("tp") || requestedRedrawType == "TARGETS") {
-                responseTextBuilder.append("🎯 **AI RISK & TARGET EXECUTION PROJECTION (${pair.symbol})**\n\n")
-                responseTextBuilder.append("I calculated optimal risk-to-reward parameters and redrawn execution targets on your chart:\n\n")
-                responseTextBuilder.append("• **Market Bias:** ${signal.type.title} (${signal.confidenceScore}% Confidence)\n")
-                responseTextBuilder.append("• **Optimal Entry:** `${signal.entryPrice}`\n")
-                responseTextBuilder.append("• **Invalidation Level (SL):** `${signal.stopLoss}`\n")
-                responseTextBuilder.append("• **Primary Target (TP1):** `${signal.takeProfit1}`\n")
-                responseTextBuilder.append("• **Extended Target (TP2):** `${signal.takeProfit2}`\n")
-                responseTextBuilder.append("• **Risk-to-Reward Ratio:** `1:${String.format(Locale.US, "%.1f", signal.riskRewardRatio)}`\n\n")
-                responseTextBuilder.append("⚠️ Maintain disciplined position sizing of 1-2% per setup.")
-            } else {
-                // General Full Analysis & Redraw
-                responseTextBuilder.append("🤖 **AI TECHNICAL ANALYSIS & REAL-TIME CHART REDRAW**\n\n")
-                responseTextBuilder.append("Asset: **${pair.symbol}** | Timeframe: **${tf.label}** | Live Price: `${pair.currentPrice}`\n\n")
-                responseTextBuilder.append("1. **Market Structure & Redrawn Levels:**\n")
-                responseTextBuilder.append("• Directional Bias: **${signal.type.title}** (Confidence: ${signal.confidenceScore}%)\n")
-                responseTextBuilder.append("• 24h Session Bounds: Low `${pair.low24h}` — High `${pair.high24h}`\n")
-                responseTextBuilder.append("• Candlestick Patterns: ${if (patterns.isEmpty()) "Consolidation / Wick Exhaustion" else patterns.joinToString { it.patternType.title }}\n\n")
-                responseTextBuilder.append("2. **Indicator Confluence:**\n")
-                responseTextBuilder.append("• RSI (14): `${String.format(Locale.US, "%.1f", signal.rsiValue)}` (${if (signal.rsiValue < 30) "Oversold Buy Zone" else if (signal.rsiValue > 70) "Overbought Rejection" else "Neutral Momentum"})\n")
-                responseTextBuilder.append("• Trend Confluence: ${signal.summaryRationale}\n\n")
-                responseTextBuilder.append("3. **Execution Plan:**\n")
-                responseTextBuilder.append("• Entry: `${signal.entryPrice}` | SL: `${signal.stopLoss}` | TP1: `${signal.takeProfit1}`\n")
-                responseTextBuilder.append("• Risk-to-Reward: `1:${String.format(Locale.US, "%.1f", signal.riskRewardRatio)}`\n")
-            }
-
-            val followUpPrompts = listOf(
-                "🪄 Redraw Key Support & Resistance",
-                "📈 Redraw Trendlines & Channels",
-                "📐 Plot Fibonacci Retracement",
-                "🎯 Show Breakout Targets (TP/SL)",
-                "🔄 Full Re-Analysis & Redraw"
-            )
-
-            val aiResponse = AiChatMessage(
-                sender = AiChatSender.AI,
-                text = responseTextBuilder.toString(),
-                chartOverlay = overlayResult ?: _aiChartOverlay.value,
-                suggestedPrompts = followUpPrompts
-            )
-
-            _aiChatMessages.value = _aiChatMessages.value + aiResponse
-            _aiReport.value = responseTextBuilder.toString()
-            _isAnalyzingAi.value = false
         }
     }
 
+    /**
+     * Full-chart analysis (report panel + optional auto-redraw). Same data-driven path as
+     * the chat, without the intent routing: overview composition locally, LLM when configured.
+     */
     fun runAiTechnicalAnalysis(isSnapshot: Boolean = false) {
         viewModelScope.launch {
             _isAnalyzingAi.value = true
             _aiReport.value = null
+            try {
 
             val pair = _selectedPair.value
             val tf = _selectedTimeframe.value
-            val candles = getCandlesForSelectedPair()
-            val signal = TechnicalAnalysisEngine.generateTradeSignal(pair, candles, tf)
-            val patterns = TechnicalAnalysisEngine.detectPatterns(candles)
-            val patternNames = patterns.joinToString(", ") { it.patternType.title }.ifEmpty { "Consolidation" }
-
             val settings = _indicatorSettings.value
-            val activeOverlaysList = mutableListOf<String>()
-            if (settings.showSma20) activeOverlaysList.add("SMA 20")
-            if (settings.showSma50) activeOverlaysList.add("SMA 50")
-            if (settings.showEma20) activeOverlaysList.add("EMA 20")
-            if (settings.showEma50) activeOverlaysList.add("EMA 50")
-            if (settings.showEma200) activeOverlaysList.add("EMA 200")
-            if (settings.showBollingerBands) activeOverlaysList.add("Bollinger Bands")
-            if (settings.showSupportResistance) activeOverlaysList.add("Support/Resistance")
-            if (settings.showRsiSubchart) activeOverlaysList.add("RSI (14)")
-            if (settings.showPatterns) activeOverlaysList.add("Pattern Markers")
-            val activeOverlaysStr = activeOverlaysList.joinToString(", ").ifEmpty { "Clean Candlesticks" }
+            val candles = getCandlesForSelectedPair()
+            val ctx = DynamicAiResponseEngine.buildContext(
+                pair = pair,
+                candles = candles,
+                timeframe = tf,
+                settings = settings,
+                parentTrends = parentTrendAlignment(tf)
+            )
+            val activeOverlaysStr = activeOverlayNames()
 
-            // Trigger AI chart redraw if enabled
+            // Trigger AI chart redraw from the same candles if enabled
             if (_aiAutoRedrawEnabled.value) {
                 _aiRedrawStep.value = "AI analyzing ${pair.symbol} structure..."
                 _aiChartOverlay.value = (_aiChartOverlay.value ?: AiChartOverlayState(pair.symbol, tf)).copy(
                     isRedrawing = true,
-                    redrawStep = "Scanning chart extremes..."
+                    redrawStep = "Scanning chart extremes & ATR volatility envelope..."
                 )
                 delay(250)
                 val newOverlay = TechnicalAnalysisEngine.generateAiChartOverlay(pair, candles, tf)
@@ -571,83 +585,55 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
                 _aiRedrawStep.value = ""
             }
 
-            // Try OpenRouter API first
+            val patternNames = ctx.patterns.joinToString(", ") { it.patternType.title }
+                .ifEmpty { "Consolidation" }
+
             val openRouterResult = repository.fetchOpenRouterAnalysis(
                 symbol = pair.symbol,
-                timeframe = _selectedTimeframe.value.label,
+                timeframe = tf.label,
                 currentPrice = pair.currentPrice,
-                signalType = signal.type.title,
-                rsiValue = signal.rsiValue,
+                signalType = ctx.signal.type.title,
+                rsiValue = ctx.signal.rsiValue,
                 patterns = patternNames,
                 isSnapshotAnalysis = isSnapshot,
-                activeOverlays = activeOverlaysStr
+                activeOverlays = activeOverlaysStr,
+                quantitativeContext = DynamicAiResponseEngine.quantitativeFactSheet(ctx)
             )
 
-            if (openRouterResult != null) {
-                _aiReport.value = openRouterResult
+            val report = if (openRouterResult != null) {
+                openRouterResult
             } else {
-                // Fallback to local rule engine simulation
-                val reportBuilder = StringBuilder()
-                if (isSnapshot) {
-                    reportBuilder.append("📸 AI SNAPSHOT MARKET CONFIRMATION REPORT\n")
-                    reportBuilder.append("Asset: ${pair.symbol} | Timeframe: ${_selectedTimeframe.value.label} | Price at Snapshot: ${pair.currentPrice}\n")
-                    reportBuilder.append("Active Overlays: $activeOverlaysStr\n")
-                    reportBuilder.append("Note: Configure OPENROUTER_API_KEY in Secrets panel to connect live Gemini/OpenRouter LLM.\n\n")
-
-                    reportBuilder.append("1. 📸 CAPTURED SNAPSHOT STRUCTURE & KEY LEVELS:\n")
-                    reportBuilder.append("• Asset & Timeframe: ${pair.symbol} (${_selectedTimeframe.value.label})\n")
-                    reportBuilder.append("• Market Bias: ${signal.type.title} (Confidence: ${signal.confidenceScore}%)\n")
-                    reportBuilder.append("• Price Bounds: 24h Low ${pair.low24h} | 24h High ${pair.high24h}\n\n")
-
-                    reportBuilder.append("2. 🔍 MANUAL TRADER CONFIRMATION CHECKLIST:\n")
-                    reportBuilder.append("• [x] Candle Rejection: ${if (patterns.isEmpty()) "Consolidation / Wick Rejection identified" else patterns.joinToString { it.patternType.title }}\n")
-                    reportBuilder.append("• [x] RSI Momentum Confluence: ${String.format(Locale.US, "%.1f", signal.rsiValue)} - ${if (signal.rsiValue < 30) "Oversold Zone (BUY Confluence)" else if (signal.rsiValue > 70) "Overbought Zone (SELL Confluence)" else "Neutral Momentum"}\n")
-                    reportBuilder.append("• [x] Dynamic Moving Average Support: ${signal.summaryRationale}\n")
-                    reportBuilder.append("• [ ] Final Execution Check: Await candle closing on ${_selectedTimeframe.value.label} chart before placing order.\n\n")
-
-                    reportBuilder.append("3. ⚠️ RISK & MANIPULATION WARNINGS:\n")
-                    reportBuilder.append("• Beware of liquidity sweeps below ${pair.low24h}. Maintain strict 1% risk per trade.\n\n")
-
-                    reportBuilder.append("4. 🏁 MANUAL TRADER EXECUTION VERDICT:\n")
-                    reportBuilder.append("• Verdict: ${signal.type.title.uppercase()} CONFIRMATION (High Probability Setup)\n")
-                    reportBuilder.append("• Entry Price: ${signal.entryPrice}\n")
-                    reportBuilder.append("• Invalid Level (SL): ${signal.stopLoss}\n")
-                    reportBuilder.append("• Target 1 (TP1): ${signal.takeProfit1} | Target 2 (TP2): ${signal.takeProfit2}\n")
-                    reportBuilder.append("• Risk-to-Reward Ratio: 1:${String.format(Locale.US, "%.1f", signal.riskRewardRatio)}\n")
-                } else {
-                    reportBuilder.append("📊 AI TECHNICAL ANALYSIS REPORT (Institutional Rule Engine)\n")
-                    reportBuilder.append("Asset: ${pair.symbol} | Timeframe: ${_selectedTimeframe.value.label} | Price: ${pair.currentPrice}\n")
-                    reportBuilder.append("Note: Configure OPENROUTER_API_KEY in Secrets panel to connect live OpenRouter LLM.\n\n")
-
-                    reportBuilder.append("1. MARKET STRUCTURE & BIAS:\n")
-                    reportBuilder.append("• Directional Bias: ${signal.type.title} (Confidence: ${signal.confidenceScore}%)\n")
-                    reportBuilder.append("• 24h Price Action Range: ${pair.low24h} - ${pair.high24h} (${pair.priceChange24h}%)\n\n")
-
-                    reportBuilder.append("2. INDICATOR CONFLUENCE:\n")
-                    reportBuilder.append("• RSI (14): ${String.format(Locale.US, "%.1f", signal.rsiValue)} - ${if (signal.rsiValue < 30) "Oversold Bounce Zone" else if (signal.rsiValue > 70) "Overbought Rejection Zone" else "Neutral Momentum"}\n")
-                    reportBuilder.append("• Trend Confluence: ${signal.summaryRationale}\n\n")
-
-                    reportBuilder.append("3. DETECTED PATTERNS & AI REDRAW:\n")
-                    if (patterns.isEmpty()) {
-                        reportBuilder.append("• Consolidation structure. Support/Resistance & Fibonacci retracement lines redrawn onto chart.\n\n")
-                    } else {
-                        patterns.forEach { p ->
-                            reportBuilder.append("• ${p.patternType.title}: ${p.patternType.description}\n")
-                        }
-                        reportBuilder.append("\n")
-                    }
-
-                    reportBuilder.append("4. STRATEGY EXECUTION PLAN:\n")
-                    reportBuilder.append("• Recommended Entry: ${signal.entryPrice}\n")
-                    reportBuilder.append("• Invalid Level (SL): ${signal.stopLoss} (${signal.timeframe.label} candle close below)\n")
-                    reportBuilder.append("• Target 1 (TP1): ${signal.takeProfit1}\n")
-                    reportBuilder.append("• Target 2 (TP2): ${signal.takeProfit2}\n")
-                    reportBuilder.append("• Risk-to-Reward Ratio: 1:${String.format(Locale.US, "%.1f", signal.riskRewardRatio)}\n")
+                val overview = DynamicAiResponseEngine.compose(
+                    ctx,
+                    DynamicAiResponseEngine.AiIntent.MARKET_OVERVIEW,
+                    userText = if (isSnapshot) "Confirm the captured chart snapshot before I execute." else null
+                )
+                val sourceLine = when (marketDataHealth.value.source) {
+                    com.example.forex.data.remote.MarketDataSource.ALPHA_VANTAGE ->
+                        "Inputs: live Alpha Vantage candles (${candles.size} bars, quality ${ctx.qualityScore}/100)."
+                    com.example.forex.data.remote.MarketDataSource.FCS_API ->
+                        "Inputs: FCS API candles (${candles.size} bars, quality ${ctx.qualityScore}/100)."
+                    else ->
+                        "Inputs: local/simulated candle history (${candles.size} bars). Configure ALPHAVANTAGE_API_KEY or FCS_API_KEY in the Secrets panel for live market data."
                 }
-
-                _aiReport.value = reportBuilder.toString()
+                if (isSnapshot) {
+                    "📸 SNAPSHOT CONFIRMATION REPORT — MANUAL TRADER CHECKLIST\n" +
+                        "Asset: ${pair.symbol} | Timeframe: ${tf.label} | Price at capture: ${pair.currentPrice}\n" +
+                        "Active Overlays: $activeOverlaysStr\n\n$overview\n\n" +
+                        "⚠️ Risk & manipulation warnings:\n" +
+                        "• Beware of liquidity sweeps below ${TechnicalAnalysisEngine.fmtPrice(ctx.supports.lastOrNull() ?: pair.low24h, pair.pipSize)} / above ${TechnicalAnalysisEngine.fmtPrice(ctx.resistances.lastOrNull() ?: pair.high24h, pair.pipSize)}.\n" +
+                        "• Await a ${tf.label} candle close before executing; keep account risk at 1% (${TechnicalAnalysisEngine.fmt(ctx.sizing.suggestedLots, 2)} lots suggested).\n" +
+                        "• ${sourceLine}"
+                } else {
+                    "📊 AI TECHNICAL ANALYSIS REPORT (Dynamic Rule Engine v2 — ATR-aware)\n" +
+                        "$sourceLine\n\n$overview"
+                }
             }
-            _isAnalyzingAi.value = false
+
+            _aiReport.value = report
+            } finally {
+                _isAnalyzingAi.value = false
+            }
         }
     }
 

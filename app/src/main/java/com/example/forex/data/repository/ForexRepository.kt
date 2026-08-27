@@ -2,6 +2,10 @@ package com.example.forex.data.repository
 
 import com.example.forex.data.db.*
 import com.example.forex.data.model.*
+import com.example.forex.data.remote.MarketDataHealth
+import com.example.forex.data.remote.MarketDataSource
+import com.example.forex.data.remote.RealMarketDataProvider
+import com.example.forex.data.validation.MarketDataValidator
 import com.example.forex.data.websocket.ForexWebSocketManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +37,10 @@ class ForexRepository(private val forexDao: ForexDao) {
     val webSocketStats: StateFlow<WebSocketStats> = webSocketManager.webSocketStats
     val webSocketStatus: StateFlow<WebSocketStatus> = webSocketManager.webSocketStatus
     val marketTicks: SharedFlow<MarketTick> = webSocketManager.marketTicks
+
+    // Real REST market data (Alpha Vantage primary, FCS fallback)
+    val realDataProvider = RealMarketDataProvider()
+    val marketDataHealth: StateFlow<MarketDataHealth> = realDataProvider.health
 
     init {
         // Initialize candle history
@@ -66,8 +74,22 @@ class ForexRepository(private val forexDao: ForexDao) {
 
     /**
      * Applies a live market tick from WebSocket directly to currency pairs and active candles.
+     *
+     * Every tick first passes through the data validation layer: malformed, inverted-quote or
+     * out-of-band (fat-finger / stale replay) ticks are discarded and can never corrupt
+     * candles, signals or the 24h extremes shown in the UI.
      */
     private fun applyMarketTick(tick: MarketTick) {
+        val referencePrice = _pairs.value.find { it.symbol == tick.symbol }?.currentPrice
+        val tickReport = MarketDataValidator.validateTick(
+            tick = tick,
+            referencePrice = referencePrice,
+            maxJumpFraction = if (PairCatalog.isCrypto(tick.symbol)) 0.15 else 0.06
+        )
+        if (!tickReport.isUsable) {
+            return // corrupt tick — drop silently (stats counters still counted it upstream)
+        }
+
         val currentList = _pairs.value
         var pairFound = false
 
@@ -174,51 +196,145 @@ class ForexRepository(private val forexDao: ForexDao) {
             val price = pair?.currentPrice ?: 1.0
             val generated = generateInitialCandles(price, timeframe)
             candleMap[key] = generated
-            
+
             repoScope.launch {
-                if (marketDataService.isConfigured()) {
-                    val tfStr = when (timeframe) {
-                        Timeframe.M1 -> "1m"
-                        Timeframe.M5 -> "5m"
-                        Timeframe.M15 -> "15m"
-                        Timeframe.H1 -> "1h"
-                        Timeframe.H4 -> "4h"
-                        Timeframe.D1 -> "1d"
-                    }
-                    val apiSymbol = symbol.replace("/", "")
-                    val result = marketDataService.fetchHistoricalCandles(apiSymbol, tfStr)
-                    if (result.isSuccess) {
-                        val networkCandles = result.getOrNull()?.map { c ->
-                            CandleStick(
-                                timestamp = c.t?.toLongOrNull()?.times(1000) ?: System.currentTimeMillis(),
-                                open = c.o?.toDoubleOrNull() ?: price,
-                                high = c.h?.toDoubleOrNull() ?: price,
-                                low = c.l?.toDoubleOrNull() ?: price,
-                                close = c.c?.toDoubleOrNull() ?: price,
-                                volume = c.v?.toDoubleOrNull() ?: 1000.0
-                            )
-                        }?.sortedBy { it.timestamp }
-                        if (networkCandles != null && networkCandles.isNotEmpty()) {
-                            candleMap[key] = networkCandles.toMutableList()
-                            forexDao.insertCandles(networkCandles.map {
-                                CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
-                            })
-                            // Trigger UI update
-                            _pairs.value = _pairs.value.toList()
-                            return@launch
-                        }
-                    }
+                val refreshed = refreshCandlesFromNetwork(symbol, timeframe)
+                if (refreshed != null) {
+                    candleMap[key] = refreshed.first.toMutableList()
+                    forexDao.insertCandles(refreshed.first.map {
+                        CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
+                    })
+                    // Trigger UI update
+                    _pairs.value = _pairs.value.toList()
+                } else {
+                    forexDao.insertCandles(generated.map {
+                        CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
+                    })
                 }
-                
-                forexDao.insertCandles(generated.map {
-                    CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
-                })
             }
         }
         return candleMap[key] ?: emptyList()
     }
 
+    /**
+     * Validated network refresh for a symbol/timeframe used by the UI, pull-to-refresh and
+     * [com.example.forex.worker.SignalWorker].
+     *
+     * Chain: Alpha Vantage (if configured; already validated inside the provider) ->
+     * FCS API (validated here) -> null, letting callers fall back to persisted/simulated data.
+     * Never throws: upstream failures are collapsed into a null result and surfaced via
+     * [marketDataHealth].
+     */
+    suspend fun refreshCandlesFromNetwork(
+        symbol: String,
+        timeframe: Timeframe,
+        forceRefresh: Boolean = false
+    ): Pair<List<CandleStick>, MarketDataSource>? {
+        val normalized = PairCatalog.definitionFor(symbol).symbol
+
+        if (realDataProvider.isConfigured()) {
+            val avResult = realDataProvider.fetchCandles(normalized, timeframe, forceRefresh)
+            val avCandles = avResult.getOrNull()
+            if (avCandles != null && avCandles.isNotEmpty()) {
+                return avCandles to MarketDataSource.ALPHA_VANTAGE
+            }
+        }
+
+        if (marketDataService.isConfigured()) {
+            try {
+                val tfStr = when (timeframe) {
+                    Timeframe.M1 -> "1m"
+                    Timeframe.M5 -> "5m"
+                    Timeframe.M15 -> "15m"
+                    Timeframe.H1 -> "1h"
+                    Timeframe.H4 -> "4h"
+                    Timeframe.D1 -> "1d"
+                }
+                val apiSymbol = normalized.replace("/", "")
+                val result = marketDataService.fetchHistoricalCandles(apiSymbol, tfStr)
+                if (result.isSuccess) {
+                    val rawCandles = result.getOrNull().orEmpty().mapNotNull { c ->
+                        val o = c.o.toDoubleOrNull() ?: return@mapNotNull null
+                        val h = c.h.toDoubleOrNull() ?: return@mapNotNull null
+                        val l = c.l.toDoubleOrNull() ?: return@mapNotNull null
+                        val cl = c.c.toDoubleOrNull() ?: return@mapNotNull null
+                        CandleStick(
+                            timestamp = c.t?.toLongOrNull()?.times(1000) ?: return@mapNotNull null,
+                            open = o,
+                            high = h,
+                            low = l,
+                            close = cl,
+                            volume = c.v?.toDoubleOrNull()?.takeIf { v -> v.isFinite() && v >= 0 } ?: 0.0
+                        )
+                    }
+                    if (rawCandles.isNotEmpty()) {
+                        val validation = MarketDataValidator.validateCandleSeries(
+                            series = rawCandles,
+                            timeframeMillis = timeframe.minutes * 60_000L,
+                            minValidCount = 24
+                        )
+                        if (validation.report.isUsable) {
+                            return validation.candles to MarketDataSource.FCS_API
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // FCS failure is non-fatal: callers fall back to cache/simulation.
+                e.printStackTrace()
+            }
+        }
+        return null
+    }
+
     private val marketDataService = ForexMarketRepositoryService()
+
+    /**
+     * Pushes a freshly validated candle series (from any source) into the live cache and
+     * Room, then nudges [pairs] so signal regeneration sees the new history immediately.
+     */
+    fun ingestCandles(symbol: String, timeframe: Timeframe, candles: List<CandleStick>) {
+        if (candles.isEmpty()) return
+        val trimmed = candles.takeLast(200)
+        candleMap[Pair(symbol, timeframe)] = trimmed.toMutableList()
+        repoScope.launch {
+            forexDao.insertCandles(trimmed.map {
+                CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
+            })
+        }
+        _pairs.value = _pairs.value.toList()
+    }
+
+    /** Force-refreshes a symbol's candles from the network and ingests the result. */
+    suspend fun refreshMarketSnapshot(symbol: String, timeframe: Timeframe): Boolean {
+        val refreshed = refreshCandlesFromNetwork(symbol, timeframe, forceRefresh = true) ?: return false
+        ingestCandles(symbol, timeframe, refreshed.first)
+        return true
+    }
+
+    /**
+     * Pulls a realtime spot quote (Alpha Vantage CURRENCY_EXCHANGE_RATE) for [symbol] and,
+     * after validation, applies it to the live pair state. Used by manual refresh actions
+     * when the WebSocket simulator is paused or unavailable.
+     */
+    suspend fun refreshLatestQuoteFor(symbol: String): Boolean {
+        val tick = realDataProvider.fetchLatestQuote(symbol).getOrNull() ?: return false
+        val report = MarketDataValidator.validateTick(
+            tick = tick,
+            referencePrice = _pairs.value.find { it.symbol == symbol }?.currentPrice,
+            maxJumpFraction = if (PairCatalog.isCrypto(symbol)) 0.15 else 0.06
+        )
+        if (!report.isUsable) return false
+        _pairs.value = _pairs.value.map { pair ->
+            if (pair.symbol == symbol) {
+                pair.copy(
+                    currentPrice = tick.price,
+                    high24h = max(pair.high24h, tick.price),
+                    low24h = min(pair.low24h, tick.price)
+                )
+            } else pair
+        }
+        return true
+    }
 
     private val openRouterRetrofit = retrofit2.Retrofit.Builder()
         .baseUrl("https://openrouter.ai/")
@@ -227,6 +343,18 @@ class ForexRepository(private val forexDao: ForexDao) {
 
     private val openRouterApi = openRouterRetrofit.create(OpenRouterApi::class.java)
 
+    /**
+     * Requests a live LLM analysis from OpenRouter.
+     *
+     * @param userQuestion when set (chat mode), the analyst prompt is framed around the
+     *   trader's actual question instead of the generic report template.
+     * @param quantitativeContext a deterministic, engine-computed fact sheet (ATR, regime,
+     *   ADX, EMA stack, key levels…) appended to every prompt so the LLM reasons over the
+     *   same validated numbers the local rule engine uses.
+     *
+     * Returns null on any failure (missing key, rate limit, empty completion) so the
+     * ViewModel can fall back to the dynamic local engine without the UI noticing.
+     */
     suspend fun fetchOpenRouterAnalysis(
         symbol: String,
         timeframe: String,
@@ -235,7 +363,9 @@ class ForexRepository(private val forexDao: ForexDao) {
         rsiValue: Double,
         patterns: String,
         isSnapshotAnalysis: Boolean = false,
-        activeOverlays: String = ""
+        activeOverlays: String = "",
+        userQuestion: String? = null,
+        quantitativeContext: String = ""
     ): String? {
         val apiKey = com.example.BuildConfig.OPENROUTER_API_KEY
         if (apiKey.isBlank() || apiKey == "YOUR_OPENROUTER_API_KEY") {
@@ -243,6 +373,13 @@ class ForexRepository(private val forexDao: ForexDao) {
         }
 
         return try {
+            val contextBlock = if (quantitativeContext.isNotBlank()) {
+                "\n- Deterministic Indicator Readings (already computed from validated candles; trust these numbers):\n$quantitativeContext\n"
+            } else ""
+            val questionBlock = if (!userQuestion.isNullOrBlank()) {
+                "\nTRADER QUESTION TO ANSWER: \"${userQuestion.take(600)}\"\nAddress this question directly in your answer.\n"
+            } else ""
+
             val prompt = if (isSnapshotAnalysis) {
                 """
                 You are a senior institutional Forex & Crypto technical analyst performing a MANUAL MARKET CONFIRMATION on a captured chart snapshot.
@@ -253,7 +390,8 @@ class ForexRepository(private val forexDao: ForexDao) {
                 - 14-period RSI: $rsiValue
                 - Active Chart Overlays & Technical Indicators: $activeOverlays
                 - Chart Patterns Detected: $patterns
-
+                $contextBlock
+                $questionBlock
                 Please generate a structured, rigorous MANUAL MARKET CONFIRMATION REPORT with the following sections:
                 1. 📸 CAPTURED SNAPSHOT STRUCTURE & KEY LEVEL CONFIRMATION
                 2. 🔍 MANUAL CHECKLIST (Candle Rejection, RSI Confluence, Moving Average Dynamic Levels)
@@ -269,7 +407,8 @@ class ForexRepository(private val forexDao: ForexDao) {
                 - Technical Signal Bias: $signalType
                 - 14-period RSI: $rsiValue
                 - Chart Patterns Detected: $patterns
-                
+                $contextBlock
+                $questionBlock
                 Please generate a structured, concise report with 4 sections:
                 1. MARKET STRUCTURE & BIAS
                 2. INDICATOR CONFLUENCE
@@ -334,7 +473,13 @@ class ForexRepository(private val forexDao: ForexDao) {
                 confidenceScore = signal.confidenceScore,
                 timeframeLabel = signal.timeframe.label,
                 summaryRationale = signal.summaryRationale,
-                timestamp = signal.timestamp
+                timestamp = signal.timestamp,
+                atrValue = signal.atrValue,
+                stopLossPips = signal.stopLossPips,
+                volatilityRegime = signal.volatilityRegime.name,
+                suggestedLotSize = signal.suggestedLotSize,
+                dataQualityScore = signal.dataQualityScore,
+                dataSource = signal.dataSource
             )
         )
     }
