@@ -12,7 +12,9 @@ pluginManagement {
   }
 }
 
-plugins { id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0" }
+// foojay-resolver-convention removed: no Java toolchain auto-provisioning is
+// needed (CI installs JDK 17) and the settings plugin is the first code every
+// Gradle invocation executes.
 
 dependencyResolutionManagement {
   repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
