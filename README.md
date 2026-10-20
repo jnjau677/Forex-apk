@@ -65,6 +65,32 @@ A modern, high-performance Android application built with **Kotlin** and **Jetpa
 
 ---
 
+## 🔐 Firebase Authentication (Email/Password + Google)
+
+Authentication is **Firebase Auth only** (`data/auth/ForexAuthManager.kt`). There is no
+local account store: passwords are never saved on-device, and the signed-in user comes
+from Firebase's auth state. Sign-in methods: **Email/Password** (with verification and
+password-reset emails) and **Google** via Credential Manager.
+
+One-time setup (required for any sign-in to work):
+
+1. In the [Firebase console](https://console.firebase.google.com), create/open a project.
+2. **Authentication → Sign-in method**: enable **Email/Password** and **Google**.
+3. **Project settings → Your apps → Add app → Android** with package name
+   `com.devcode.forex`, then download **`google-services.json`** and place it at
+   **`app/google-services.json`**. (For Google Sign-In also register your debug/release
+   **SHA‑1 / SHA‑256** fingerprints under Project settings → Your apps → SHA certificate
+   fingerprints, then re-download `google-services.json`; the plugin generates
+   `R.string.default_web_client_id` from it, which Credential Manager requires.)
+4. Rebuild. Without `google-services.json` the app still runs, but authentication
+   fails closed with a "Firebase is not configured" message — it never falls back
+   to a local account database.
+
+For CI, store the file base64-encoded as the `GOOGLE_SERVICES_JSON` GitHub secret
+(`base64 -w 0 app/google-services.json`); the workflow decodes it before building.
+
+---
+
 ## 🔑 Environment Secret Configuration
 
 Configure your API keys in the AI Studio **Secrets** panel or in `.env`:

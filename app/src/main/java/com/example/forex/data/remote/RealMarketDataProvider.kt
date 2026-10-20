@@ -113,7 +113,10 @@ class RealMarketDataProvider(
     private val candleCacheTtlOverrideMs: Long? = null,
     private val clock: () -> Long = System::currentTimeMillis,
     client: OkHttpClient? = null,
-    private val api: AlphaVantageApi? = null
+    private val api: AlphaVantageApi? = null,
+    /** Optional durable quota state: (utcDay yyyyMMdd -> requests used that day). */
+    private val quotaPersistLoad: (() -> Pair<String, Int>)? = null,
+    private val quotaPersistSave: ((String, Int) -> Unit)? = null
 ) : MarketDataProvider {
 
     private val okHttpClient: OkHttpClient = client ?: OkHttpClient.Builder()
@@ -135,10 +138,20 @@ class RealMarketDataProvider(
     override val health: StateFlow<MarketDataHealth> = _health.asStateFlow()
 
     // --- self-imposed request budgeting (all mutation happens under requestMutex) ---
-    private val requestMutex = Mutex()
-    private var lastRequestAt = 0L
-    private var requestDayUtc = ""
-    private var requestsToday = 0
+    // The counters live in the companion (process-wide) so every provider instance —
+    // repository, ViewModel path, SignalWorker — shares ONE daily budget instead of
+    // each silently assuming a fresh quota (F-10). Callers may additionally inject
+    // quotaPersistLoad/Save to survive process death.
+    private val requestMutex get() = sharedRequestMutex
+    private var lastRequestAt
+        get() = sharedLastRequestAt
+        set(value) { sharedLastRequestAt = value }
+    private var requestDayUtc
+        get() = sharedRequestDayUtc
+        set(value) { sharedRequestDayUtc = value }
+    private var requestsToday
+        get() = sharedRequestsToday
+        set(value) { sharedRequestsToday = value }
 
     private data class CacheEntry(val payload: List<CandleStick>, val fetchedAt: Long)
 
@@ -262,6 +275,12 @@ class RealMarketDataProvider(
     )
 
     internal companion object {
+
+        // Process-wide quota state shared by all provider instances (F-10).
+        val sharedRequestMutex = Mutex()
+        @Volatile var sharedLastRequestAt = 0L
+        @Volatile var sharedRequestDayUtc = ""
+        @Volatile var sharedRequestsToday = 0
 
         const val DEFAULT_DAILY_QUOTA = 25
         const val DEFAULT_MIN_REQUEST_INTERVAL_MS = 13_000L
@@ -515,8 +534,14 @@ class RealMarketDataProvider(
 
         private fun resolveCandleTimestamp(row: List<String>, idxEpoch: Int, idxTime: Int): Long? {
             if (idxEpoch >= 0) {
-                row.getOrNull(idxEpoch)?.toLongOrNull()?.let { raw ->
-                    return if (raw > 1_000_000_000_000L) raw else raw * 1000L
+                row.getOrNull(idxEpoch)?.let { cell ->
+                    cell.toLongOrNull()?.let { raw ->
+                        return if (raw > 1_000_000_000_000L) raw else raw * 1000L
+                    }
+                    // Alpha Vantage's daily CSVs put DATE STRINGS ("2024-01-01") in
+                    // the "timestamp" column — fall back to date parsing before
+                    // giving up on the row.
+                    resolveEpochOrDate(cell)?.let { return it }
                 }
             }
             return row.getOrNull(idxTime)?.let { resolveEpochOrDate(it) }
@@ -549,8 +574,11 @@ class RealMarketDataProvider(
             val now = clock()
             val today = utcDay(now)
             if (today != requestDayUtc) {
+                // New UTC day (or first request this process): adopt any durably
+                // persisted count for today so process death can't reset the budget.
+                val persisted = quotaPersistLoad?.invoke()
                 requestDayUtc = today
-                requestsToday = 0
+                requestsToday = if (persisted != null && persisted.first == today) persisted.second else 0
             }
             if (requestsToday >= dailyQuota) throw MarketDataException.DailyQuotaExhausted()
             val waitMs = lastRequestAt + minRequestIntervalMs - now
@@ -567,6 +595,7 @@ class RealMarketDataProvider(
                 // even if the envelope reports a rate limit or premium restriction.
                 lastRequestAt = clock()
                 requestsToday++
+                quotaPersistSave?.invoke(requestDayUtc, requestsToday)
                 return classifyAndExtract(raw, response.code())
             } catch (e: IOException) {
                 // Transport failure: honor request pacing but do not burn daily quota.

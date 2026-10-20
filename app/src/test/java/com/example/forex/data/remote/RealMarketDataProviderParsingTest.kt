@@ -167,4 +167,20 @@ class RealMarketDataProviderParsingTest {
         assertEquals(java.util.Calendar.JUNE, cal.get(java.util.Calendar.MONTH))
         assertEquals(12, cal.get(java.util.Calendar.DAY_OF_MONTH))
     }
+
+
+    @Test
+    fun `daily CSV with date strings in timestamp column parses`() {
+        // This is the real Alpha Vantage FX_DAILY shape: header is "timestamp"
+        // but cells are dates, not epochs.
+        val csv = """
+            timestamp,open,high,low,close,volume
+            2024-06-10,1.0840,1.0860,1.0830,1.0850,1200
+            2024-06-11,1.0850,1.0870,1.0840,1.0865,1350
+        """.trimIndent()
+        val candles = RealMarketDataProvider.parseTimeSeriesCsv(csv).getOrThrow()
+        assertEquals(2, candles.size)
+        assertTrue(candles[0].timestamp < candles[1].timestamp)
+        assertEquals(1.0865, candles[1].close, 1e-9)
+    }
 }

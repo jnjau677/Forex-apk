@@ -25,9 +25,8 @@ class ForexMarketRepositoryService(
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
-        .addInterceptor(HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BASIC
-        })
+        // NOTE: deliberately no HttpLoggingInterceptor — the FCS access_key travels
+        // in the query string and BASIC logging would write it to logcat (F-05).
         .build()
 
     private val retrofit = Retrofit.Builder()
@@ -39,7 +38,7 @@ class ForexMarketRepositoryService(
     val apiService: FcsApi = retrofit.create(FcsApi::class.java)
 
     fun isConfigured(): Boolean {
-        return apiKey.isNotBlank() && apiKey != "YOUR_FCS_API_KEY"
+        return apiKey.isNotBlank() && !apiKey.startsWith("YOUR_", ignoreCase = true)
     }
 
     suspend fun fetchLatestPrices(symbols: List<String>): Result<List<FcsPriceInfo>> {

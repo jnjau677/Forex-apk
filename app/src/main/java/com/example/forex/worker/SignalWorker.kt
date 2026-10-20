@@ -22,6 +22,7 @@ import com.example.forex.data.model.Timeframe
 import com.example.forex.data.model.TradeSignal
 import com.example.forex.data.model.CandleStick
 import com.example.forex.data.remote.MarketDataException
+import com.example.forex.data.remote.MarketDataSource
 import com.example.forex.data.remote.RealMarketDataProvider
 import com.example.forex.data.repository.ForexMarketRepositoryService
 import com.example.forex.data.repository.TechnicalAnalysisEngine
@@ -53,8 +54,11 @@ class SignalWorker(
 ) : CoroutineWorker(context, workerParams) {
 
     private val dao: ForexDao = ForexDatabase.getDatabase(context).forexDao()
-    private val marketProvider = RealMarketDataProvider()
-    private val fcsService = ForexMarketRepositoryService()
+
+    /** Keys resolved through SecureApiKeyManager (user key wins, bundled fallback) — F-05. */
+    private val secureKeys = com.example.forex.data.security.SecureApiKeyManager.getInstance(context)
+    private val marketProvider = RealMarketDataProvider(apiKey = secureKeys.getAlphaVantageApiKey().orEmpty())
+    private val fcsService = ForexMarketRepositoryService(apiKey = secureKeys.getFcsApiKey().orEmpty())
 
     override suspend fun doWork(): Result {
         val config = WorkConfig.from(inputData)
@@ -118,7 +122,7 @@ class SignalWorker(
     // ------------------------------------------------------------------
 
     private suspend fun analyzeSymbol(symbol: String, config: WorkConfig, settings: IndicatorSettings): TradeSignal? {
-        val candles = loadCandles(symbol, config)
+        val (candles, candleSource) = loadCandles(symbol, config)
         if (candles.size < MIN_CANDLES_FOR_ANALYSIS) {
             throw IllegalStateException("only ${candles.size} validated candles (< $MIN_CANDLES_FOR_ANALYSIS required)")
         }
@@ -134,16 +138,14 @@ class SignalWorker(
             low24h = recent.minOf { it.low }
         )
 
-        val source = if (config.allowNetwork && marketProvider.isConfigured()) {
-            "ALPHA_VANTAGE/FCS"
-        } else if (config.allowNetwork) "FCS_API/ROOM" else "ROOM"
-
+        // Label the signal with the candles' actual provenance (network source or
+        // the stored source of the Room rows) — never a configuration guess (F-06).
         return TechnicalAnalysisEngine.generateTradeSignal(
             pair = pair,
             candles = candles,
             timeframe = config.timeframe,
             settings = settings,
-            dataSource = source
+            dataSource = candleSource
         )
     }
 
@@ -153,33 +155,44 @@ class SignalWorker(
      * Simulated candles are deliberately NOT generated in the worker: a background
      * notification must only ever reflect real market data.
      */
-    private suspend fun loadCandles(symbol: String, config: WorkConfig): List<CandleStick> {
+    private suspend fun loadCandles(symbol: String, config: WorkConfig): Pair<List<CandleStick>, String> {
         val normalized = PairCatalog.definitionFor(symbol).symbol
         val tfName = config.timeframe.name
 
         if (config.allowNetwork) {
             val fetched = fetchFromNetwork(normalized, config)
             if (fetched != null) {
-                // Persist for offline analysis; keep Room bounded per symbol/timeframe.
+                val (candles, source) = fetched
+                // Persist for offline analysis (tagged with provenance); keep Room bounded.
                 dao.deleteCandles(normalized, tfName)
-                dao.insertCandles(fetched.takeLast(MAX_CANDLES_KEPT).map {
-                    CandleEntity(normalized, tfName, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
+                dao.insertCandles(candles.takeLast(MAX_CANDLES_KEPT).map {
+                    CandleEntity(
+                        normalized, tfName, it.timestamp, it.open, it.high, it.low, it.close, it.volume,
+                        dataSource = source
+                    )
                 })
-                return fetched
+                return candles to source
             }
             // Network unavailable/exhausted — fall through to locally persisted history.
         }
 
-        return dao.getCandles(normalized, tfName).map {
+        // Refuse simulated rows: background signals/notifications must reflect real
+        // market data only (F-06). Stored source comes from the rows themselves.
+        val stored = dao.getCandles(normalized, tfName)
+            .filter { it.dataSource != MarketDataSource.SIMULATION.name }
+        val storedSource = stored.firstOrNull()?.dataSource ?: "ROOM"
+        return stored.map {
             CandleStick(it.timestamp, it.open, it.high, it.low, it.close, it.volume)
-        }
+        } to storedSource
     }
 
-    private suspend fun fetchFromNetwork(symbol: String, config: WorkConfig): List<CandleStick>? {
+    private suspend fun fetchFromNetwork(symbol: String, config: WorkConfig): Pair<List<CandleStick>, String>? {
         if (marketProvider.isConfigured()) {
             val result = marketProvider.fetchCandles(symbol, config.timeframe)
             val candles = result.getOrNull()
-            if (candles != null && candles.size >= MIN_CANDLES_FOR_ANALYSIS) return candles
+            if (candles != null && candles.size >= MIN_CANDLES_FOR_ANALYSIS) {
+                return candles to MarketDataSource.ALPHA_VANTAGE.name
+            }
             // Quota/premium/network misses fall through to FCS without aborting the scan.
         }
         if (fcsService.isConfigured()) {
@@ -205,7 +218,9 @@ class SignalWorker(
                 val validation = MarketDataValidator.validateCandleSeries(
                     mapped, config.timeframe.minutes * 60_000L, minValidCount = MIN_CANDLES_FOR_ANALYSIS
                 )
-                if (validation.report.isUsable) return validation.candles
+                if (validation.report.isUsable) {
+                    return validation.candles to MarketDataSource.FCS_API.name
+                }
             }
         }
         return null

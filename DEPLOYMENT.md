@@ -107,3 +107,4 @@ Add these in your GitHub repository under **Settings > Secrets and variables > A
 - `STORE_PASSWORD`: Password for keystore
 - `KEY_PASSWORD`: Password for upload key alias
 - `GEMINI_API_KEY`: Google Gemini API key
+- `GOOGLE_SERVICES_JSON`: Base64-encoded `app/google-services.json` (`base64 -w 0 app/google-services.json`) — enables Firebase Authentication (Email/Password + Google) in CI builds

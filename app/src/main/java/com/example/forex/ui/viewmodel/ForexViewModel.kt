@@ -1,6 +1,7 @@
 package com.example.forex.ui.viewmodel
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -14,74 +15,96 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import com.example.forex.data.auth.AuthResult
 import com.example.forex.data.auth.ForexAuthManager
-import com.example.forex.data.auth.GoogleAuthClient
-import com.google.firebase.auth.FirebaseUser
 
 class ForexViewModel(application: Application) : AndroidViewModel(application) {
     private val db = ForexDatabase.getDatabase(application)
-    private val repository = ForexRepository(db.forexDao())
-    private val authManager = ForexAuthManager(application.applicationContext, db.forexDao())
-    private val googleAuthClient = GoogleAuthClient(application.applicationContext)
+    private val repository = ForexRepository(application.applicationContext, db.forexDao())
 
-    // User Authentication States
-    val currentUser: StateFlow<UserProfile?> = authManager.activeUserProfileFlow.stateIn(
+    // --- Authentication: Firebase Auth is the only auth path (see ForexAuthManager) ---
+    private val authManager = ForexAuthManager(application.applicationContext)
+
+    /** Signed-in Firebase user (null when signed out or Firebase is not configured). */
+    val currentUser: StateFlow<UserProfile?> = authManager.currentUser.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5000),
         null
     )
 
+    /** True when this build carries a real google-services.json and Firebase Auth can run. */
+    val isAuthConfigured: Boolean = authManager.isConfigured
+
     private val _isAuthLoading = MutableStateFlow(false)
     val isAuthLoading: StateFlow<Boolean> = _isAuthLoading.asStateFlow()
 
-    private val _authErrorMessage = MutableStateFlow<String?>(null)
+    private val _authErrorMessage = MutableStateFlow<String?>(
+        if (authManager.isConfigured) null else ForexAuthManager.NOT_CONFIGURED_MESSAGE
+    )
     val authErrorMessage: StateFlow<String?> = _authErrorMessage.asStateFlow()
+
+    /** Non-error auth notices, e.g. "password reset email sent". */
+    private val _authInfoMessage = MutableStateFlow<String?>(null)
+    val authInfoMessage: StateFlow<String?> = _authInfoMessage.asStateFlow()
 
     fun clearAuthError() {
         _authErrorMessage.value = null
+        _authInfoMessage.value = null
+    }
+
+    private fun runAuth(block: suspend () -> AuthResult, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            _isAuthLoading.value = true
+            _authErrorMessage.value = null
+            _authInfoMessage.value = null
+            try {
+                val result = block()
+                if (result.success) {
+                    onResult(true)
+                } else {
+                    _authErrorMessage.value = result.errorMessage
+                    onResult(false)
+                }
+            } catch (e: Exception) {
+                _authErrorMessage.value = e.message ?: "Authentication failed. Please try again."
+                onResult(false)
+            } finally {
+                _isAuthLoading.value = false
+            }
+        }
     }
 
     fun signUpWithEmail(email: String, password: String, displayName: String, onResult: (Boolean) -> Unit = {}) {
-        viewModelScope.launch {
-            _isAuthLoading.value = true
-            _authErrorMessage.value = null
-            val result = authManager.signUpWithEmail(email, password, displayName)
-            _isAuthLoading.value = false
-            if (result.success) {
-                onResult(true)
-            } else {
-                _authErrorMessage.value = result.errorMessage
-                onResult(false)
-            }
-        }
+        runAuth({ authManager.signUpWithEmail(email, password, displayName) }, onResult)
     }
 
     fun signInWithEmail(email: String, password: String, onResult: (Boolean) -> Unit = {}) {
-        viewModelScope.launch {
-            _isAuthLoading.value = true
-            _authErrorMessage.value = null
-            val result = authManager.signInWithEmail(email, password)
-            _isAuthLoading.value = false
-            if (result.success) {
-                onResult(true)
-            } else {
-                _authErrorMessage.value = result.errorMessage
-                onResult(false)
-            }
-        }
+        runAuth({ authManager.signInWithEmail(email, password) }, onResult)
     }
 
-    fun signInWithGoogle(onResult: (Boolean) -> Unit = {}) {
+    /**
+     * Google Sign-In needs an Activity [context] for the Credential Manager
+     * picker — callers in Compose pass `LocalContext.current`.
+     */
+    fun signInWithGoogle(context: Context, onResult: (Boolean) -> Unit = {}) {
+        runAuth({ authManager.signInWithGoogle(context) }, onResult)
+    }
+
+    fun sendPasswordResetEmail(email: String) {
         viewModelScope.launch {
             _isAuthLoading.value = true
             _authErrorMessage.value = null
-            val result = authManager.signInWithGoogle()
-            _isAuthLoading.value = false
-            if (result.success) {
-                onResult(true)
-            } else {
-                _authErrorMessage.value = result.errorMessage
-                onResult(false)
+            _authInfoMessage.value = null
+            try {
+                val result = authManager.sendPasswordResetEmail(email)
+                if (result.success) {
+                    _authInfoMessage.value =
+                        "Password reset email sent. Check your inbox for the Firebase reset link."
+                } else {
+                    _authErrorMessage.value = result.errorMessage
+                }
+            } finally {
+                _isAuthLoading.value = false
             }
         }
     }
@@ -108,7 +131,7 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.saveIndicatorSettings(newSettings)
         }
-        generateAllSignals(pairs.value)
+        generateAllSignals(pairs.value, force = true)
     }
 
     private val _inspectedSignal = MutableStateFlow<TradeSignal?>(null)
@@ -259,8 +282,16 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
                 updatedPairs.find { it.symbol == _selectedPair.value.symbol }?.let {
                     _selectedPair.value = it
                 }
-                // Generate live signals across active pairs
+                // Throttled inside (max once / 5s): full 9-pair signal regeneration
+                // on every sub-second tick was pure battery burn (F-10).
                 generateAllSignals(updatedPairs)
+            }
+        }
+
+        // F-07: post a notification the moment an alert triggers.
+        viewModelScope.launch {
+            repository.alertTriggers.collect { alert ->
+                postAlertNotification(alert)
             }
         }
 
@@ -284,12 +315,57 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
     }
 
 
-    private fun generateAllSignals(currentPairs: List<CurrencyPair>) {
+    @Volatile
+    private var lastSignalGenerationAt = 0L
+
+    /**
+     * @param force bypass the 5s throttle — used by explicit user actions
+     * (refresh, settings change); the tick stream calls are throttled (F-10).
+     */
+    private fun generateAllSignals(currentPairs: List<CurrencyPair>, force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastSignalGenerationAt < 5_000L) return
+        lastSignalGenerationAt = now
         val signals = currentPairs.map { pair ->
             val candles = repository.getCandles(pair.symbol, _selectedTimeframe.value)
             TechnicalAnalysisEngine.generateTradeSignal(pair, candles, _selectedTimeframe.value, _indicatorSettings.value)
         }
         _liveSignals.value = signals
+    }
+
+    /** F-07: system notification for a triggered alert (permission-checked, channel-created). */
+    private fun postAlertNotification(alert: CustomAlert) {
+        val context = getApplication<Application>().applicationContext
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context, android.Manifest.permission.POST_NOTIFICATIONS
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return // Evaluator already persisted the trigger; just don't notify without permission.
+        }
+        val channelId = "price_alerts"
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            manager.createNotificationChannel(
+                android.app.NotificationChannel(channelId, "Price Alerts", android.app.NotificationManager.IMPORTANCE_HIGH)
+            )
+        }
+        val conditionText = when (alert.condition) {
+            AlertCondition.PRICE_ABOVE -> "rose above ${alert.targetValue}"
+            AlertCondition.PRICE_BELOW -> "fell below ${alert.targetValue}"
+            AlertCondition.RSI_OVERBOUGHT -> "RSI reached overbought (${alert.targetValue})"
+            AlertCondition.RSI_OVERSOLD -> "RSI reached oversold (${alert.targetValue})"
+            AlertCondition.MA_BULLISH_CROSS -> "bullish MA crossover"
+            AlertCondition.MA_BEARISH_CROSS -> "bearish MA crossover"
+        }
+        val notification = androidx.core.app.NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("${alert.pairSymbol} alert triggered")
+            .setContentText("${alert.pairSymbol} $conditionText")
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+        manager.notify(alert.id.hashCode(), notification)
     }
 
     /**
@@ -302,7 +378,7 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
             triggerChartLoading(650)
             repository.refreshMarketSnapshot(_selectedPair.value.symbol, _selectedTimeframe.value)
             repository.refreshLatestQuoteFor(_selectedPair.value.symbol)
-            generateAllSignals(pairs.value)
+            generateAllSignals(pairs.value, force = true)
         }
     }
 
@@ -378,7 +454,7 @@ class ForexViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.saveIndicatorSettings(updated)
         }
-        generateAllSignals(pairs.value)
+        generateAllSignals(pairs.value, force = true)
     }
 
     fun setInspectedSignal(signal: TradeSignal?) {

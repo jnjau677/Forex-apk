@@ -20,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -49,6 +50,8 @@ fun ChartTerminalScreen(
     val currentUser by viewModel.currentUser.collectAsState()
     val isAuthLoading by viewModel.isAuthLoading.collectAsState()
     val authErrorMessage by viewModel.authErrorMessage.collectAsState()
+    val authInfoMessage by viewModel.authInfoMessage.collectAsState()
+    val activityContext = LocalContext.current
     val webSocketStats by viewModel.webSocketStats.collectAsState()
     val candleVersion by viewModel.candleVersion.collectAsState()
     val aiChartOverlay by viewModel.aiChartOverlay.collectAsState()
@@ -217,6 +220,7 @@ fun ChartTerminalScreen(
                     currentUser = currentUser,
                     isLoading = isAuthLoading,
                     errorMessage = authErrorMessage,
+                    infoMessage = authInfoMessage,
                     onSignInEmail = { email, pwd ->
                         viewModel.signInWithEmail(email, pwd) { success ->
                             if (success) showAuthDialog = false
@@ -228,9 +232,13 @@ fun ChartTerminalScreen(
                         }
                     },
                     onSignInGoogle = {
-                        viewModel.signInWithGoogle { success ->
+                        // Credential Manager needs the Activity context, not the app context.
+                        viewModel.signInWithGoogle(activityContext) { success ->
                             if (success) showAuthDialog = false
                         }
+                    },
+                    onSendPasswordResetEmail = { email ->
+                        viewModel.sendPasswordResetEmail(email)
                     },
                     onSignOut = {
                         viewModel.signOut()
