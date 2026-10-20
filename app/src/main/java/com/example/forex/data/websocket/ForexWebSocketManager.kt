@@ -66,9 +66,25 @@ class ForexWebSocketManager {
     private val previousPrices = mutableMapOf<String, Double>()
 
     companion object {
-        const val DEFAULT_WS_URL = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
+        /**
+         * Targeted combined stream for exactly the symbols this app maps to pairs.
+         * The previous default (`!miniTicker@arr`) pushed ~1,000 symbols/sec through
+         * the parser for the sake of five — a needless battery/bandwidth cost (F-06).
+         * Note these are Binance *crypto* tickers (BTC, tokenised gold PAXG, EUR/USD
+         * stablecoin pairs) used as price references — not an interbank FX feed.
+         */
+        const val DEFAULT_WS_URL =
+            "wss://stream.binance.com:9443/stream?streams=" +
+                "btcusdt@miniTicker/paxgusdt@miniTicker/eurusdt@miniTicker/gbpusdt@miniTicker"
         const val COMBINED_TRADES_URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/eurgbp@trade/xrpusdt@trade"
     }
+
+    /** True only while the Binance socket is actually open (drives honest status labels). */
+    @Volatile
+    private var socketConnected = false
+
+    /** Last real (socket) tick per app symbol; the simulation pulse must not fight real ticks. */
+    private val lastRealTickAt = mutableMapOf<String, Long>()
 
     private var currentWsUrl = DEFAULT_WS_URL
 
@@ -105,11 +121,17 @@ class ForexWebSocketManager {
 
         lastPingTimestamp = System.currentTimeMillis()
 
+        // (Re)start the simulation pulse if a previous disconnect() stopped it.
+        if (pulseJob?.isActive != true) {
+            startLiveTickPulseEngine()
+        }
+
         activeWebSocket?.cancel()
         activeWebSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 val latency = (System.currentTimeMillis() - lastPingTimestamp).coerceAtLeast(8)
                 reconnectAttempt = 0
+                socketConnected = true
                 _webSocketStatus.value = WebSocketStatus.CONNECTED
                 updateStats(WebSocketStatus.CONNECTED, latency = latency)
             }
@@ -121,11 +143,13 @@ class ForexWebSocketManager {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                socketConnected = false
                 _webSocketStatus.value = WebSocketStatus.DISCONNECTED
                 updateStats(WebSocketStatus.DISCONNECTED)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                socketConnected = false
                 _webSocketStatus.value = WebSocketStatus.DISCONNECTED
                 updateStats(WebSocketStatus.DISCONNECTED)
                 if (!isManualDisconnect) {
@@ -134,6 +158,7 @@ class ForexWebSocketManager {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                socketConnected = false
                 _webSocketStatus.value = WebSocketStatus.ERROR
                 updateStats(WebSocketStatus.ERROR)
                 if (!isManualDisconnect) {
@@ -163,12 +188,20 @@ class ForexWebSocketManager {
             } else if (jsonText.startsWith("{")) {
                 val root = JSONObject(jsonText)
                 if (root.has("data")) {
+                    // Combined-stream envelope: {"stream":"btcusdt@miniTicker","data":{…}}
+                    // miniTicker payloads carry close in "c" (+ base volume "v");
+                    // trade payloads carry price in "p" (+ quantity "q").
                     val data = root.getJSONObject("data")
                     val rawSymbol = data.optString("s", "")
-                    val price = data.optDouble("p", 0.0)
-                    val quantity = data.optDouble("q", 0.0)
-                    if (rawSymbol.isNotBlank() && price > 0.0) {
-                        processRawSymbolTick(rawSymbol, price, quantity, latency)
+                    val miniClose = data.optDouble("c", 0.0)
+                    if (rawSymbol.isNotBlank() && miniClose > 0.0) {
+                        processRawSymbolTick(rawSymbol, miniClose, data.optDouble("v", 0.0), latency)
+                    } else {
+                        val price = data.optDouble("p", 0.0)
+                        val quantity = data.optDouble("q", 0.0)
+                        if (rawSymbol.isNotBlank() && price > 0.0) {
+                            processRawSymbolTick(rawSymbol, price, quantity, latency)
+                        }
                     }
                 } else if (root.has("s") && root.has("c")) {
                     val rawSymbol = root.optString("s", "")
@@ -190,30 +223,37 @@ class ForexWebSocketManager {
     private fun processRawSymbolTick(rawSymbol: String, rawPrice: Double, volume: Double, latency: Long) {
         when {
             rawSymbol.equals("BTCUSDT", ignoreCase = true) -> {
-                dispatchTick("BTC/USD", rawPrice, volume, latency)
+                dispatchTick("BTC/USD", rawPrice, volume, latency, isRealTick = true)
             }
             rawSymbol.equals("PAXGUSDT", ignoreCase = true) || rawSymbol.equals("XAUUSDT", ignoreCase = true) -> {
-                dispatchTick("XAU/USD", rawPrice, volume, latency)
+                dispatchTick("XAU/USD", rawPrice, volume, latency, isRealTick = true)
             }
             rawSymbol.equals("EURUSDT", ignoreCase = true) -> {
-                dispatchTick("EUR/USD", rawPrice, volume, latency)
+                dispatchTick("EUR/USD", rawPrice, volume, latency, isRealTick = true)
             }
             rawSymbol.equals("GBPUSDT", ignoreCase = true) -> {
-                dispatchTick("GBP/USD", rawPrice, volume, latency)
+                dispatchTick("GBP/USD", rawPrice, volume, latency, isRealTick = true)
             }
             rawSymbol.equals("EURGBP", ignoreCase = true) -> {
-                // Synthesize EUR/USD & GBP/USD adjustments
+                // Derive GBP/USD from the EUR/USD reference and the EUR/GBP cross.
                 val eurusd = latestPrices["EUR/USD"] ?: 1.0850
                 val gbpEst = eurusd / rawPrice
-                dispatchTick("GBP/USD", gbpEst, volume, latency)
+                dispatchTick("GBP/USD", gbpEst, volume, latency, isRealTick = true)
             }
         }
     }
 
     /**
-     * Dispatches a normalized market tick into the SharedFlow
+     * Dispatches a normalized market tick into the SharedFlow.
+     *
+     * [isRealTick] marks socket-sourced ticks. The reported status is honest:
+     * CONNECTED only while the Binance socket is open; otherwise ticks (from the
+     * simulation pulse) are labelled SIMULATED (F-06).
      */
-    fun dispatchTick(symbol: String, price: Double, volume: Double, latency: Long = 20) {
+    fun dispatchTick(symbol: String, price: Double, volume: Double, latency: Long = 20, isRealTick: Boolean = false) {
+        if (isRealTick) {
+            lastRealTickAt[symbol] = System.currentTimeMillis()
+        }
         val prevPrice = latestPrices[symbol] ?: price
         val direction = when {
             price > prevPrice -> PriceDirection.UP
@@ -253,16 +293,20 @@ class ForexWebSocketManager {
             _marketTicks.emit(tick)
         }
 
+        val effectiveStatus = if (socketConnected) WebSocketStatus.CONNECTED else WebSocketStatus.SIMULATED
+        _webSocketStatus.value = effectiveStatus
         updateStats(
-            status = WebSocketStatus.CONNECTED,
+            status = effectiveStatus,
             latency = latency,
             totalTicks = tickCount
         )
     }
 
     /**
-     * High-frequency Live Tick Pulse Engine.
-     * Ensures sub-second price fluctuations across all pairs with real interbank liquidity micro-ticks.
+     * Simulation pulse: generates plausible micro-ticks for pairs the Binance
+     * stream does not cover (JPY crosses, AUD/USD, USD/CAD) and as an offline
+     * fallback. Ticks are labelled SIMULATED unless the socket is live, and the
+     * pulse never overrides a symbol that received a real tick in the last 5s.
      */
     private fun startLiveTickPulseEngine() {
         pulseJob?.cancel()
@@ -278,6 +322,9 @@ class ForexWebSocketManager {
                 val activeBatch = pairs.shuffled().take(Random.nextInt(1, 4))
 
                 for (symbol in activeBatch) {
+                    // Never fight a real socket tick with a simulated one.
+                    val lastReal = lastRealTickAt[symbol] ?: 0L
+                    if (System.currentTimeMillis() - lastReal < 5_000L) continue
                     val current = latestPrices[symbol] ?: continue
                     val pipChange = when (symbol) {
                         "USD/JPY", "EUR/JPY", "GBP/JPY" -> Random.nextDouble(-0.035, 0.035)
@@ -350,6 +397,12 @@ class ForexWebSocketManager {
      */
     fun disconnect() {
         isManualDisconnect = true
+        socketConnected = false
+        reconnectJob?.cancel()
+        // Stop the simulation pulse too: after an explicit disconnect the price
+        // board must freeze, not keep "ticking" on fabricated data (F-06).
+        pulseJob?.cancel()
+        pulseJob = null
         activeWebSocket?.close(1000, "User disconnected")
         activeWebSocket = null
         _webSocketStatus.value = WebSocketStatus.DISCONNECTED

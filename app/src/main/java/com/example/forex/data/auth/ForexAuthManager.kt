@@ -2,296 +2,328 @@ package com.example.forex.data.auth
 
 import android.content.Context
 import android.util.Log
+import android.util.Patterns
+import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialException
-import com.example.forex.data.db.ForexDao
-import com.example.forex.data.db.UserProfileEntity
 import com.example.forex.data.model.UserProfile
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
-import com.google.firebase.FirebaseApp
-import com.google.firebase.FirebaseOptions
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.FirebaseTooManyRequestsException
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthException
+import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
+import com.google.firebase.auth.FirebaseAuthInvalidUserException
+import com.google.firebase.auth.FirebaseAuthUserCollisionException
+import com.google.firebase.auth.FirebaseAuthWeakPasswordException
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.UserProfileChangeRequest
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
-import java.security.MessageDigest
-import java.util.UUID
 
-class ForexAuthManager(
-    private val context: Context,
-    private val forexDao: ForexDao
-) {
-    private val auth: FirebaseAuth? by lazy {
+/**
+ * The app's single authentication path: **Firebase Authentication**.
+ *
+ * Supported providers: Email/Password and Google (via Credential Manager).
+ *
+ * Design rules (deliberately strict — see REVIEW.md F-04):
+ *  - No local credential store. Passwords are only ever sent to Firebase;
+ *    no password, hash or user record is persisted in Room or SharedPreferences.
+ *  - No fallback accounts. If Firebase is unreachable or unconfigured, sign-in
+ *    fails with an actionable error instead of silently creating a local user.
+ *  - No dummy Firebase initialisation. Firebase is initialised by the
+ *    google-services plugin from `app/google-services.json`; when that file is
+ *    absent [FirebaseAuth.getInstance] throws, we treat the app as
+ *    "auth not configured" ([isConfigured] == false) and say so in the UI.
+ *  - The signed-in user is derived exclusively from [FirebaseAuth]'s auth
+ *    state, so it survives process death exactly as Firebase persists it.
+ */
+class ForexAuthManager(private val appContext: Context) {
+
+    private val firebaseAuth: FirebaseAuth? by lazy {
         try {
             FirebaseAuth.getInstance()
-        } catch (e: IllegalStateException) {
-            try {
-                FirebaseApp.initializeApp(context)
-                FirebaseAuth.getInstance()
-            } catch (e2: Exception) {
-                try {
-                    val options = FirebaseOptions.Builder()
-                        .setApplicationId("1:1234567890:android:abcdef1234567890")
-                        .setApiKey("dummy_api_key_for_firebase")
-                        .setProjectId("dummy-project")
-                        .build()
-                    FirebaseApp.initializeApp(context, options)
-                    FirebaseAuth.getInstance()
-                } catch (e3: Exception) {
-                    null
-                }
-            }
+        } catch (e: Exception) {
+            // Default FirebaseApp not initialised: google-services.json missing
+            // or the google-services Gradle plugin did not run.
+            Log.w(TAG, "Firebase Auth unavailable: ${e.message}")
+            null
         }
     }
 
-    private val credentialManager = CredentialManager.create(context)
+    /** True when a real Firebase project backs this build (google-services.json present). */
+    val isConfigured: Boolean get() = firebaseAuth != null
 
-    val activeUserProfileFlow: Flow<UserProfile?> = forexDao.getActiveUserProfile().map { entity ->
-        entity?.let {
-            UserProfile(
-                uid = it.uid,
-                email = it.email,
-                displayName = it.displayName,
-                photoUrl = it.photoUrl,
-                accountTier = it.accountTier,
-                joinedAt = it.joinedAt
-            )
+    /** The currently signed-in Firebase user, or null. Mirrors Firebase's own session persistence. */
+    val currentFirebaseUser: FirebaseUser? get() = firebaseAuth?.currentUser
+
+    /**
+     * Auth state as a cold [Flow] backed by Firebase's [FirebaseAuth.AuthStateListener].
+     * Emits the current user immediately on collection, then on every sign-in/out.
+     */
+    val currentUser: Flow<UserProfile?> = callbackFlow {
+        val auth = firebaseAuth
+        if (auth == null) {
+            trySend(null)
+            close()
+            return@callbackFlow
         }
+        val listener = FirebaseAuth.AuthStateListener { firebase ->
+            trySend(firebase.currentUser?.toUserProfile())
+        }
+        auth.addAuthStateListener(listener)
+        awaitClose { auth.removeAuthStateListener(listener) }
     }
 
-    private fun hashPassword(password: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest(password.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
+    // ---------------------------------------------------------------------
+    // Email / Password
+    // ---------------------------------------------------------------------
 
-    suspend fun signUpWithEmail(email: String, password: String, displayName: String): AuthResultWrapper {
+    suspend fun signUpWithEmail(email: String, password: String, displayName: String): AuthResult {
+        val auth = firebaseAuth ?: return AuthResult.failure(NOT_CONFIGURED_MESSAGE)
         val cleanEmail = email.trim().lowercase()
-        val cleanName = displayName.trim().ifBlank { cleanEmail.substringBefore("@").replaceFirstChar { it.uppercase() } }
+        val cleanName = displayName.trim()
+            .ifBlank { cleanEmail.substringBefore("@").replaceFirstChar { it.uppercase() } }
 
-        if (cleanEmail.isBlank() || !cleanEmail.contains("@")) {
-            return AuthResultWrapper(success = false, errorMessage = "Please enter a valid email address.")
-        }
+        validateEmail(cleanEmail)?.let { return AuthResult.failure(it) }
         if (password.length < 6) {
-            return AuthResultWrapper(success = false, errorMessage = "Password must be at least 6 characters.")
+            return AuthResult.failure("Password must be at least 6 characters.")
         }
 
-        // Try Firebase first if initialized
-        var firebaseUid: String? = null
-        try {
-            auth?.let { fbAuth ->
-                val result = fbAuth.createUserWithEmailAndPassword(cleanEmail, password).await()
-                result.user?.let { u ->
-                    firebaseUid = u.uid
-                    try {
-                        val profileUpdates = UserProfileChangeRequest.Builder()
-                            .setDisplayName(cleanName)
-                            .build()
-                        u.updateProfile(profileUpdates).await()
-                    } catch (_: Exception) {}
-                }
+        return try {
+            val result = auth.createUserWithEmailAndPassword(cleanEmail, password).await()
+            val user = result.user ?: return AuthResult.failure("Account creation failed. Please try again.")
+            try {
+                user.updateProfile(
+                    UserProfileChangeRequest.Builder().setDisplayName(cleanName).build()
+                ).await()
+            } catch (e: Exception) {
+                Log.w(TAG, "Display name update failed (non-fatal): ${e.message}")
             }
+            // Best effort: verification mail confirms ownership of the address.
+            try {
+                user.sendEmailVerification().await()
+            } catch (e: Exception) {
+                Log.w(TAG, "Email verification send failed (non-fatal): ${e.message}")
+            }
+            AuthResult.success(user.toUserProfile().copy(displayName = cleanName))
         } catch (e: Exception) {
-            Log.w("ForexAuthManager", "Firebase signup failed/skipped: ${e.message}")
-            // If email is already in use in Firebase, return error
-            if (e.message?.contains("email address is already in use", ignoreCase = true) == true) {
-                return AuthResultWrapper(success = false, errorMessage = "An account with this email already exists.")
-            }
+            Log.w(TAG, "Sign-up failed: ${e.message}")
+            AuthResult.failure(friendlyAuthError(e))
         }
-
-        // Check local DB
-        val existingLocal = forexDao.getUserByEmail(cleanEmail)
-        if (existingLocal != null && firebaseUid == null) {
-            return AuthResultWrapper(success = false, errorMessage = "An account with this email already exists locally.")
-        }
-
-        val finalUid = firebaseUid ?: existingLocal?.uid ?: UUID.randomUUID().toString()
-        forexDao.logoutAllUsers()
-
-        val newUser = UserProfileEntity(
-            uid = finalUid,
-            email = cleanEmail,
-            displayName = cleanName,
-            passwordHash = hashPassword(password),
-            accountTier = "Pro Trader",
-            joinedAt = System.currentTimeMillis(),
-            isLoggedIn = true
-        )
-        forexDao.insertOrUpdateUser(newUser)
-
-        return AuthResultWrapper(
-            success = true,
-            user = UserProfile(
-                uid = newUser.uid,
-                email = newUser.email,
-                displayName = newUser.displayName,
-                accountTier = newUser.accountTier,
-                joinedAt = newUser.joinedAt
-            )
-        )
     }
 
-    suspend fun signInWithEmail(email: String, password: String): AuthResultWrapper {
+    suspend fun signInWithEmail(email: String, password: String): AuthResult {
+        val auth = firebaseAuth ?: return AuthResult.failure(NOT_CONFIGURED_MESSAGE)
         val cleanEmail = email.trim().lowercase()
-        if (cleanEmail.isBlank() || !cleanEmail.contains("@")) {
-            return AuthResultWrapper(success = false, errorMessage = "Please enter a valid email address.")
-        }
+
+        validateEmail(cleanEmail)?.let { return AuthResult.failure(it) }
         if (password.isBlank()) {
-            return AuthResultWrapper(success = false, errorMessage = "Please enter your password.")
+            return AuthResult.failure("Please enter your password.")
         }
 
-        // Try Firebase first
-        var firebaseSuccess = false
-        var fbUser: FirebaseUser? = null
-        try {
-            auth?.let { fbAuth ->
-                val result = fbAuth.signInWithEmailAndPassword(cleanEmail, password).await()
-                fbUser = result.user
-                if (fbUser != null) {
-                    firebaseSuccess = true
-                }
-            }
+        return try {
+            val result = auth.signInWithEmailAndPassword(cleanEmail, password).await()
+            val user = result.user ?: return AuthResult.failure("Sign-in failed. Please try again.")
+            AuthResult.success(user.toUserProfile())
         } catch (e: Exception) {
-            Log.w("ForexAuthManager", "Firebase signIn failed/skipped: ${e.message}")
+            Log.w(TAG, "Sign-in failed: ${e.message}")
+            AuthResult.failure(friendlyAuthError(e))
         }
+    }
 
-        if (firebaseSuccess && fbUser != null) {
-            val u = fbUser!!
-            forexDao.logoutAllUsers()
-            val userEntity = UserProfileEntity(
-                uid = u.uid,
-                email = u.email ?: cleanEmail,
-                displayName = u.displayName ?: cleanEmail.substringBefore("@"),
-                photoUrl = u.photoUrl?.toString(),
-                passwordHash = hashPassword(password),
-                accountTier = "Pro Trader",
-                isLoggedIn = true
-            )
-            forexDao.insertOrUpdateUser(userEntity)
-            return AuthResultWrapper(
-                success = true,
-                user = UserProfile(
-                    uid = userEntity.uid,
-                    email = userEntity.email,
-                    displayName = userEntity.displayName,
-                    photoUrl = userEntity.photoUrl,
-                    accountTier = userEntity.accountTier,
-                    joinedAt = userEntity.joinedAt
-                )
-            )
+    /** Sends a Firebase password-reset email. Used by the "Forgot password?" action. */
+    suspend fun sendPasswordResetEmail(email: String): AuthResult {
+        val auth = firebaseAuth ?: return AuthResult.failure(NOT_CONFIGURED_MESSAGE)
+        val cleanEmail = email.trim().lowercase()
+        validateEmail(cleanEmail)?.let { return AuthResult.failure(it) }
+
+        return try {
+            auth.sendPasswordResetEmail(cleanEmail).await()
+            AuthResult.success(null)
+        } catch (e: Exception) {
+            Log.w(TAG, "Password reset failed: ${e.message}")
+            AuthResult.failure(friendlyAuthError(e))
         }
+    }
 
-        // Fallback to local secure user store
-        val localUser = forexDao.getUserByEmail(cleanEmail)
-        if (localUser != null) {
-            val inputHash = hashPassword(password)
-            if (localUser.passwordHash == inputHash || localUser.passwordHash == null) {
-                forexDao.logoutAllUsers()
-                forexDao.setActiveUser(localUser.uid)
-                return AuthResultWrapper(
-                    success = true,
-                    user = UserProfile(
-                        uid = localUser.uid,
-                        email = localUser.email,
-                        displayName = localUser.displayName,
-                        photoUrl = localUser.photoUrl,
-                        accountTier = localUser.accountTier,
-                        joinedAt = localUser.joinedAt
-                    )
-                )
+    // ---------------------------------------------------------------------
+    // Google (Credential Manager -> Firebase)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Google Sign-In.
+     *
+     * [activityContext] must be an Activity context: Credential Manager needs
+     * an Activity to render the credential picker, so the application context
+     * is not sufficient here. The Web client ID is read from
+     * `R.string.default_web_client_id`, which the google-services plugin only
+     * generates when `google-services.json` (with an OAuth web client) exists —
+     * hence the reflective lookup: this code must still compile in builds where
+     * Firebase has not been set up yet, and then fail with a clear message.
+     */
+    suspend fun signInWithGoogle(activityContext: Context): AuthResult {
+        val auth = firebaseAuth ?: return AuthResult.failure(NOT_CONFIGURED_MESSAGE)
+
+        val webClientId = resolveWebClientId(activityContext)
+            ?: return AuthResult.failure(
+                "Google Sign-In is not configured for this build. Add app/google-services.json " +
+                    "and enable the Google provider in the Firebase console."
+            )
+
+        val googleIdOption = GetGoogleIdOption.Builder()
+            .setFilterByAuthorizedAccounts(false)
+            .setServerClientId(webClientId)
+            .setAutoSelectEnabled(false)
+            .build()
+
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleIdOption)
+            .build()
+
+        return try {
+            val response = CredentialManager.create(activityContext)
+                .getCredential(activityContext, request)
+            val credential = response.credential
+
+            if (credential is CustomCredential &&
+                credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+            ) {
+                val googleCredential = GoogleIdTokenCredential.createFrom(credential.data)
+                val firebaseCredential = GoogleAuthProvider.getCredential(googleCredential.idToken, null)
+                val result = auth.signInWithCredential(firebaseCredential).await()
+                val user = result.user ?: return AuthResult.failure("Google Sign-In failed. Please try again.")
+                AuthResult.success(user.toUserProfile())
             } else {
-                return AuthResultWrapper(success = false, errorMessage = "Incorrect password. Please try again.")
+                AuthResult.failure("Invalid Google credential received.")
             }
-        }
-
-        return AuthResultWrapper(
-            success = false,
-            errorMessage = "No account found with this email. Please sign up."
-        )
-    }
-
-    suspend fun signInWithGoogle(): AuthResultWrapper {
-        try {
-            if (auth == null) {
-                return AuthResultWrapper(success = false, errorMessage = "Authentication service unavailable.")
-            }
-
-            val webClientId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
-                .let { if (it != 0) context.getString(it) else "YOUR_WEB_CLIENT_ID" }
-
-            val googleIdOption = GetGoogleIdOption.Builder()
-                .setFilterByAuthorizedAccounts(false)
-                .setServerClientId(webClientId)
-                .setAutoSelectEnabled(false)
-                .build()
-
-            val request = GetCredentialRequest.Builder()
-                .addCredentialOption(googleIdOption)
-                .build()
-
-            val result = credentialManager.getCredential(context, request)
-            val credential = result.credential
-
-            if (credential is CustomCredential && credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
-                val googleIdTokenCredential = GoogleIdTokenCredential.createFrom(credential.data)
-                val idToken = googleIdTokenCredential.idToken
-                
-                val firebaseCredential = GoogleAuthProvider.getCredential(idToken, null)
-                val authResult = auth!!.signInWithCredential(firebaseCredential).await()
-                val user = authResult.user
-
-                if (user != null) {
-                    forexDao.logoutAllUsers()
-                    val profileEntity = UserProfileEntity(
-                        uid = user.uid,
-                        email = user.email ?: "trader@forex.ai",
-                        displayName = user.displayName ?: "Trader",
-                        photoUrl = user.photoUrl?.toString(),
-                        accountTier = "Pro Trader",
-                        isLoggedIn = true
-                    )
-                    forexDao.insertOrUpdateUser(profileEntity)
-
-                    return AuthResultWrapper(
-                        success = true,
-                        user = UserProfile(
-                            uid = profileEntity.uid,
-                            email = profileEntity.email,
-                            displayName = profileEntity.displayName,
-                            photoUrl = profileEntity.photoUrl,
-                            accountTier = profileEntity.accountTier,
-                            joinedAt = profileEntity.joinedAt
-                        )
-                    )
-                }
-            }
-            return AuthResultWrapper(success = false, errorMessage = "Invalid Google credential received.")
         } catch (e: GetCredentialException) {
-            Log.e("ForexAuthManager", "Google Credential Exception: ${e.message}")
-            return AuthResultWrapper(success = false, errorMessage = e.message ?: "Google Sign-In was cancelled.")
+            // Subtype by class name (Cancellation / NoCredential are subclasses whose
+            // exact availability varies across credentials-ktx versions).
+            Log.w(TAG, "Credential Manager failed (${e.javaClass.simpleName}): ${e.message}")
+            AuthResult.failure(
+                when {
+                    e.javaClass.simpleName.contains("Cancellation") ->
+                        "Google Sign-In was cancelled."
+                    e.javaClass.simpleName.contains("NoCredential") ->
+                        "No Google account is available on this device. Add one in device Settings, then try again."
+                    else -> e.message ?: "Google Sign-In failed."
+                }
+            )
         } catch (e: Exception) {
-            Log.e("ForexAuthManager", "Google Sign-in Exception: ${e.message}")
-            return AuthResultWrapper(success = false, errorMessage = e.message ?: "Failed to sign in with Google.")
+            Log.w(TAG, "Google Sign-In failed: ${e.message}")
+            AuthResult.failure(friendlyAuthError(e))
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Session
+    // ---------------------------------------------------------------------
+
+    /** Signs out of Firebase and clears Credential Manager state so the next sign-in shows the account picker. */
     suspend fun signOut() {
         try {
-            auth?.signOut()
+            firebaseAuth?.signOut()
         } catch (e: Exception) {
-            Log.w("ForexAuthManager", "Error signing out from Firebase: ${e.message}")
+            Log.w(TAG, "Firebase sign-out failed: ${e.message}")
         }
-        forexDao.logoutAllUsers()
+        try {
+            CredentialManager.create(appContext).clearCredentialState(ClearCredentialStateRequest())
+        } catch (e: Exception) {
+            // Non-fatal: Firebase sign-out above already ended the app session.
+            Log.w(TAG, "Clearing credential state failed: ${e.message}")
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    private fun resolveWebClientId(context: Context): String? {
+        val resId = context.resources.getIdentifier(
+            "default_web_client_id", "string", context.packageName
+        )
+        if (resId == 0) return null
+        return context.getString(resId).takeIf { it.isNotBlank() && !it.startsWith("YOUR_") }
+    }
+
+    private fun validateEmail(email: String): String? = when {
+        email.isBlank() -> "Please enter your email address."
+        !Patterns.EMAIL_ADDRESS.matcher(email).matches() -> "Please enter a valid email address."
+        else -> null
+    }
+
+    companion object {
+        private const val TAG = "ForexAuthManager"
+
+        const val NOT_CONFIGURED_MESSAGE =
+            "Firebase is not configured for this build. Add app/google-services.json " +
+                "(Firebase console → Project settings → Your apps) and rebuild. See README → Firebase Authentication."
+
+        /** Maps Firebase failures to messages a trader can act on. Never leaks credential detail. */
+        internal fun friendlyAuthError(e: Exception): String = when (e) {
+            is FirebaseAuthWeakPasswordException ->
+                "That password is too weak. Use at least 6 characters, mixing letters and numbers."
+            is FirebaseAuthUserCollisionException ->
+                "An account with this email already exists. Try logging in instead."
+            is FirebaseAuthInvalidUserException ->
+                "No account found with this email, or the account has been disabled. Please sign up first."
+            is FirebaseAuthInvalidCredentialsException ->
+                "Incorrect email or password. Please check both and try again."
+            is FirebaseNetworkException ->
+                "Network error. Check your connection and try again."
+            is FirebaseTooManyRequestsException ->
+                "Too many sign-in attempts. Please wait a few minutes and try again."
+            is FirebaseAuthException -> when (e.errorCode) {
+                "ERROR_INVALID_EMAIL" -> "Please enter a valid email address."
+                "ERROR_USER_NOT_FOUND" -> "No account found with this email. Please sign up first."
+                "ERROR_WRONG_PASSWORD", "ERROR_INVALID_CREDENTIAL" ->
+                    "Incorrect email or password. Please check both and try again."
+                "ERROR_EMAIL_ALREADY_IN_USE" -> "An account with this email already exists. Try logging in instead."
+                "ERROR_REQUIRES_RECENT_LOGIN" -> "Please log in again to complete this action."
+                "ERROR_OPERATION_NOT_ALLOWED" ->
+                    "This sign-in method is disabled. Enable it in the Firebase console → Authentication → Sign-in method."
+                else -> e.message ?: "Authentication failed. Please try again."
+            }
+            else -> e.message ?: "Authentication failed. Please try again."
+        }
     }
 }
 
-data class AuthResultWrapper(
+/** Firebase -> UI profile. `joinedAt` comes from Firebase account metadata, never a local row. */
+private fun FirebaseUser.toUserProfile(): UserProfile {
+    val provider = providerData
+        .map { it.providerId }
+        .firstOrNull { it != "firebase" }
+        ?: providerData.firstOrNull()?.providerId
+    return UserProfile(
+        uid = uid,
+        email = email.orEmpty(),
+        displayName = displayName?.takeIf { it.isNotBlank() }
+            ?: email?.substringBefore("@")?.replaceFirstChar { it.uppercase() }
+            ?: "Trader",
+        photoUrl = photoUrl?.toString(),
+        isAnonymous = isAnonymous,
+        joinedAt = metadata?.creationTimestamp ?: System.currentTimeMillis(),
+        isEmailVerified = isEmailVerified,
+        authProvider = provider
+    )
+}
+
+/** Result of an auth operation. On success [user] is set (except for password reset). */
+data class AuthResult(
     val success: Boolean,
     val user: UserProfile? = null,
     val errorMessage: String? = null
-)
+) {
+    companion object {
+        fun success(user: UserProfile?) = AuthResult(success = true, user = user)
+        fun failure(message: String) = AuthResult(success = false, errorMessage = message)
+    }
+}

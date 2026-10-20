@@ -5,6 +5,7 @@ import com.example.forex.data.model.MarketTick
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Data validation layer for all inbound market data (REST candles, WebSocket ticks,

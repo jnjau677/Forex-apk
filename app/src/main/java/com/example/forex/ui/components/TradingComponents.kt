@@ -154,6 +154,7 @@ fun LiveTickerHeader(
                     if (webSocketStats != null) {
                         val statusColor = when (webSocketStats.status) {
                             WebSocketStatus.CONNECTED -> Color(0xFF10B981)
+                            WebSocketStatus.SIMULATED -> Color(0xFFF59E0B)
                             WebSocketStatus.CONNECTING, WebSocketStatus.RECONNECTING -> Color(0xFFF59E0B)
                             WebSocketStatus.DISCONNECTED, WebSocketStatus.ERROR -> Color(0xFFEF4444)
                         }

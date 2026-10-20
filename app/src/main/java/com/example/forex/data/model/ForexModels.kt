@@ -159,7 +159,11 @@ data class UserProfile(
     val photoUrl: String? = null,
     val isAnonymous: Boolean = false,
     val joinedAt: Long = System.currentTimeMillis(),
-    val accountTier: String = "Pro Trader"
+    val accountTier: String = "Pro Trader",
+    /** From FirebaseUser.isEmailVerified — false for fresh password accounts until the link is clicked. */
+    val isEmailVerified: Boolean = false,
+    /** Firebase provider id that created the session: "password", "google.com", … */
+    val authProvider: String? = null
 )
 
 data class IndicatorSettings(
@@ -199,7 +203,9 @@ data class IndicatorSettings(
 
 enum class WebSocketStatus(val label: String) {
     CONNECTING("Connecting..."),
-    CONNECTED("Live WS Connected"),
+    CONNECTED("Live (Binance)"),
+    /** Socket down; prices shown come from the local simulation engine. Never label these "live". */
+    SIMULATED("Simulated Feed"),
     DISCONNECTED("Disconnected"),
     RECONNECTING("Reconnecting..."),
     ERROR("Connection Error")
