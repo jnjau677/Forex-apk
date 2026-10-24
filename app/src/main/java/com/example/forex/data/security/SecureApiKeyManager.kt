@@ -1,6 +1,7 @@
 package com.example.forex.data.security
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.example.BuildConfig
@@ -17,7 +18,7 @@ class SecureApiKeyManager(private val context: Context) {
             .build()
     }
 
-    private val encryptedPreferences: EncryptedSharedPreferences by lazy {
+    private val encryptedPreferences: SharedPreferences by lazy {
         EncryptedSharedPreferences.create(
             context,
             SECURE_PREFS_NAME,

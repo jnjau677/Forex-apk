@@ -94,7 +94,7 @@ object DynamicAiResponseEngine {
             patterns = patterns,
             emaFast = TechnicalAnalysisEngine.calculateEMA(closes, settings.emaPeriod1).lastOrNull { it != null } ?: pair.currentPrice,
             emaSlow = TechnicalAnalysisEngine.calculateEMA(closes, settings.emaPeriod2).lastOrNull { it != null } ?: pair.currentPrice,
-            emaTrend = if (closes.size >= settings.emaPeriod3)
+            emaTrend = if (candles.size >= settings.emaPeriod3)
                 TechnicalAnalysisEngine.calculateEMA(closes, settings.emaPeriod3).lastOrNull { it != null } else null,
             rsi = signal.rsiValue,
             macdHistogram = macdHist,
@@ -123,8 +123,12 @@ object DynamicAiResponseEngine {
         }
         val lower = userText.lowercase(Locale.US)
         fun has(vararg keys: String) = keys.any { lower.contains(it) }
+        // Word-boundary match for "lot"/"lots": a plain substring check for "lot" also
+        // hits "plot", so chart-redraw requests like "plot fib retracement" were routed
+        // to POSITION_SIZING instead of FIBONACCI.
+        val mentionsLots = Regex("\blots?\b").containsMatchIn(lower)
         return when {
-            has("lot", "position size", "sizing", "how much", "risk per trade", "margin") -> AiIntent.POSITION_SIZING
+            mentionsLots || has("position size", "sizing", "how much", "risk per trade", "margin") -> AiIntent.POSITION_SIZING
             has("atr", "volatil", "squeeze", "turbulen", "news risk") -> AiIntent.VOLATILITY
             has("fib") -> AiIntent.FIBONACCI
             has("support", "resistance", "zone", "level", "demand", "supply") -> AiIntent.SUPPORT_RESISTANCE
@@ -343,7 +347,7 @@ object DynamicAiResponseEngine {
             appendLine("- EMA stack: fast ${ctx.emaFast} / slow ${ctx.emaSlow}" + (ctx.emaTrend?.let { " / trend $it" } ?: ""))
             appendLine("- ATR(14): ${String.format(Locale.US, "%.1f", ctx.sizing.atrPips)} pips | Volatility regime: ${ctx.sizing.regime.label}")
             ctx.adx?.let { appendLine("- ADX(14): ${String.format(Locale.US, "%.1f", it)}") }
-            appendLine("- Swing levels: supports ${ctx.supports.joinToString() { String.format(Locale.US, "%.5f", it) }.ifBlank { "n/a" }} | resistances ${ctx.resistances.joinToString() { String.format(Locale.US, "%.5f", it) }.ifBlank { "n/a" }}")
+            appendLine("- Swing levels: supports ${ctx.supports.joinToString { String.format(Locale.US, "%.5f", it) }.ifBlank { "n/a" }} | resistances ${ctx.resistances.joinToString { String.format(Locale.US, "%.5f", it) }.ifBlank { "n/a" }}")
             append("- ATR-sized plan: entry ${s.entryPrice} SL ${s.stopLoss} (${String.format(Locale.US, "%.1f", s.stopLossPips)} pips) TP1 ${s.takeProfit1} TP2 ${s.takeProfit2} RR 1:${String.format(Locale.US, "%.1f", s.riskRewardRatio)}")
         }
     }

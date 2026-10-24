@@ -42,11 +42,24 @@ android {
   buildTypes {
     release {
       isCrunchPngs = false
-      isMinifyEnabled = false
+      // R8: obfuscates code (raises the bar for extracting API keys from the APK) and
+      // shrinks the app. Keep rules for Retrofit/Moshi DTOs live in proguard-rules.pro.
+      isMinifyEnabled = true
+      isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      // debug.keystore is deliberately git-ignored (see .gitignore), so CI checkouts never
+      // contain it and assembling a debug APK there failed with a missing-keystore error.
+      // Local builds keep the project keystore when present; CI falls back to the standard
+      // Android debug keystore, which AGP provisions automatically (~/.android/debug.keystore).
+      signingConfig = if (file("${rootDir}/debug.keystore").exists()) {
+        signingConfigs.getByName("debugConfig")
+      } else {
+        signingConfigs.getByName("debug")
+      }
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
@@ -57,6 +70,16 @@ android {
     buildConfig = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+}
+
+// Surface per-test lifecycle events so a hanging or failing unit test is immediately
+// identifiable in the CI log (which the workflow tee's to gradle-test.log) instead
+// of stalling the pipeline silently.
+tasks.withType<Test>().configureEach {
+  testLogging {
+    events("started", "passed", "skipped", "failed")
+    showStandardStreams = true
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -119,6 +142,7 @@ dependencies {
   testImplementation(libs.androidx.junit)
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
+  testImplementation(libs.androidx.work.testing)
   testImplementation(libs.robolectric)
   testImplementation(libs.roborazzi)
   testImplementation(libs.roborazzi.compose)

@@ -15,15 +15,51 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import com.example.forex.data.auth.ForexAuthManager
-import com.example.forex.data.auth.GoogleAuthClient
 import com.google.firebase.auth.FirebaseUser
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.example.forex.worker.SignalWorker
+import com.example.forex.worker.UNIQUE_PERIODIC
+import kotlinx.coroutines.withContext
 
 class ForexViewModel(application: Application) : AndroidViewModel(application) {
     private val db = ForexDatabase.getDatabase(application)
     private val repository = ForexRepository(db.forexDao())
     private val authManager = ForexAuthManager(application.applicationContext, db.forexDao())
-    private val googleAuthClient = GoogleAuthClient(application.applicationContext)
 
+    // ------------------------------------------------------------------
+    // Diagnostics
+    // ------------------------------------------------------------------
+
+    /**
+     * Human-readable outcome of the most recent background signal scan
+     * (unique periodic WorkManager work), surfaced by the Diagnostics tab.
+     */
+    suspend fun fetchLastSignalScan(): String = try {
+        val app = getApplication<Application>()
+        val workInfos = withContext(Dispatchers.IO) {
+            WorkManager.getInstance(app.applicationContext)
+                .getWorkInfosForUniqueWork(UNIQUE_PERIODIC).get()
+        }
+        val info = workInfos.firstOrNull {
+            it.state == WorkInfo.State.SUCCEEDED ||
+                it.state == WorkInfo.State.FAILED ||
+                it.state == WorkInfo.State.RUNNING ||
+                it.state == WorkInfo.State.ENQUEUED
+        } ?: workInfos.firstOrNull()
+        if (info == null) {
+            "No signal scans have run yet."
+        } else {
+            val note = info.outputData.getString(SignalWorker.KEY_OUTPUT_NOTE).orEmpty()
+            "State: " + info.state.name +
+                " | Scanned: " + info.outputData.getInt(SignalWorker.KEY_OUTPUT_SCANNED, 0) +
+                " | Notified: " + info.outputData.getInt(SignalWorker.KEY_OUTPUT_NOTIFIED, 0) +
+                (if (note.isNotBlank()) " | Note: " + note else "")
+        }
+    } catch (e: Exception) {
+        // WorkManager may not be initialized yet (before first schedule); surface, never crash.
+        "Signal scan status unavailable: " + (e.message ?: e.javaClass.simpleName)
+    }
     // User Authentication States
     val currentUser: StateFlow<UserProfile?> = authManager.activeUserProfileFlow.stateIn(
         viewModelScope,

@@ -41,7 +41,8 @@ enum class ForexAppTab(
     SIGNALS("Signals", Icons.Filled.ElectricBolt, Icons.Outlined.ElectricBolt, "nav_tab_signals"),
     ALERTS("Alerts", Icons.Filled.NotificationsActive, Icons.Outlined.NotificationsActive, "nav_tab_alerts"),
     CALCULATOR("Risk Calc", Icons.Filled.Calculate, Icons.Outlined.Calculate, "nav_tab_calculator"),
-    AI_BREAKDOWN("AI Analyst", Icons.Filled.AutoAwesome, Icons.Outlined.AutoAwesome, "nav_tab_ai")
+    AI_BREAKDOWN("AI Analyst", Icons.Filled.AutoAwesome, Icons.Outlined.AutoAwesome, "nav_tab_ai"),
+    DIAGNOSTICS("Diagnostics", Icons.Filled.BugReport, Icons.Outlined.BugReport, "nav_tab_diagnostics")
 }
 
 class MainActivity : ComponentActivity() {
@@ -147,6 +148,9 @@ fun ForexAppContent(viewModel: ForexViewModel = viewModel()) {
                 }
                 ForexAppTab.AI_BREAKDOWN -> {
                     AiAnalystScreen(viewModel = viewModel)
+                }
+                ForexAppTab.DIAGNOSTICS -> {
+                    DiagnosticsScreen(viewModel = viewModel)
                 }
             }
         }
