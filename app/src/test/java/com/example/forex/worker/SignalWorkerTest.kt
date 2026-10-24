@@ -9,6 +9,7 @@ import androidx.work.testing.SynchronousExecutor
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.testing.WorkManagerTestInitHelper
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -49,7 +50,12 @@ class SignalWorkerTest {
             )
             .build()
 
-        val result = runBlocking { worker.doWork() }
+        // Hard ceiling: a regression that makes this scan hang fails the test in
+        // two minutes instead of stalling the whole CI job (JUnit @Test(timeout)
+        // is not used because it moves the test off the Robolectric main thread).
+        val result = runBlocking {
+            withTimeout(120_000) { worker.doWork() }
+        }
 
         assertTrue(result is ListenableWorker.Result.Success)
         val output = (result as ListenableWorker.Result.Success).outputData

@@ -72,6 +72,16 @@ android {
   testOptions { unitTests { isIncludeAndroidResources = true } }
 }
 
+// Surface per-test lifecycle events so a hanging or failing unit test is immediately
+// identifiable in the CI log (which the workflow tee's to gradle-test.log) instead
+// of stalling the pipeline silently.
+tasks.withType<Test>().configureEach {
+  testLogging {
+    events("started", "passed", "skipped", "failed")
+    showStandardStreams = true
+  }
+}
+
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
 secrets {
