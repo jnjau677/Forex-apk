@@ -49,7 +49,17 @@ android {
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      // debug.keystore is deliberately git-ignored (see .gitignore), so CI checkouts never
+      // contain it and assembling a debug APK there failed with a missing-keystore error.
+      // Local builds keep the project keystore when present; CI falls back to the standard
+      // Android debug keystore, which AGP provisions automatically (~/.android/debug.keystore).
+      signingConfig = if (file("${rootDir}/debug.keystore").exists()) {
+        signingConfigs.getByName("debugConfig")
+      } else {
+        signingConfigs.getByName("debug")
+      }
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
