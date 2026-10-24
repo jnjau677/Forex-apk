@@ -25,19 +25,32 @@ jobs:
           distribution: 'temurin'
           cache: 'gradle'
 
+      # No Gradle wrapper is committed yet, so ./gradlew cannot run. Install the
+      # minimum Gradle version required by AGP 9.1.1 directly.
+      # TODO: commit the wrapper ("gradle wrapper --gradle-version 9.3.1") and drop this pin.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
 
       - name: Create .env Configuration
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FCS_API_KEY: ${{ secrets.FCS_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
         run: |
           touch .env
-          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          if [ -n "$GEMINI_API_KEY" ]; then echo "GEMINI_API_KEY=$GEMINI_API_KEY" >> .env; fi
+          if [ -n "$FCS_API_KEY" ]; then echo "FCS_API_KEY=$FCS_API_KEY" >> .env; fi
+          if [ -n "$OPENROUTER_API_KEY" ]; then echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" >> .env; fi
+          if [ -n "$ALPHAVANTAGE_API_KEY" ]; then echo "ALPHAVANTAGE_API_KEY=$ALPHAVANTAGE_API_KEY" >> .env; fi
 
       - name: Run Unit Tests
-        run: ./gradlew :app:testDebugUnitTest
+        run: gradle :app:testDebugUnitTest
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug
+        run: gradle assembleDebug
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
@@ -65,18 +78,40 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      # Fail fast with an actionable message instead of an obscure Gradle signing error.
+      - name: Verify Release Signing Secrets
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$RELEASE_KEYSTORE_BASE64" ] || [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Release signing secrets are not fully configured."
+            echo "::error::Set RELEASE_KEYSTORE_BASE64, STORE_PASSWORD and KEY_PASSWORD under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
 
       - name: Decode Release Keystore
-        if: ${{ env.RELEASE_KEYSTORE_BASE64 != '' }}
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: |
           echo "$RELEASE_KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
 
       - name: Create .env Configuration
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FCS_API_KEY: ${{ secrets.FCS_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
         run: |
           touch .env
-          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          if [ -n "$GEMINI_API_KEY" ]; then echo "GEMINI_API_KEY=$GEMINI_API_KEY" >> .env; fi
+          if [ -n "$FCS_API_KEY" ]; then echo "FCS_API_KEY=$FCS_API_KEY" >> .env; fi
+          if [ -n "$OPENROUTER_API_KEY" ]; then echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" >> .env; fi
+          if [ -n "$ALPHAVANTAGE_API_KEY" ]; then echo "ALPHAVANTAGE_API_KEY=$ALPHAVANTAGE_API_KEY" >> .env; fi
 
       - name: Build Release Bundle (AAB) & APK
         env:
@@ -84,7 +119,7 @@ jobs:
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          ./gradlew bundleRelease assembleRelease
+          gradle bundleRelease assembleRelease
 
       - name: Upload Release Bundle (AAB)
         uses: actions/upload-artifact@v4

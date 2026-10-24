@@ -15,14 +15,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import com.example.forex.data.auth.ForexAuthManager
-import com.example.forex.data.auth.GoogleAuthClient
 import com.google.firebase.auth.FirebaseUser
 
 class ForexViewModel(application: Application) : AndroidViewModel(application) {
     private val db = ForexDatabase.getDatabase(application)
     private val repository = ForexRepository(db.forexDao())
     private val authManager = ForexAuthManager(application.applicationContext, db.forexDao())
-    private val googleAuthClient = GoogleAuthClient(application.applicationContext)
 
     // User Authentication States
     val currentUser: StateFlow<UserProfile?> = authManager.activeUserProfileFlow.stateIn(
