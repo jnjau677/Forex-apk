@@ -75,63 +75,96 @@ class ForexAuthManager(
         }
     }
 
-    /**
-     * Salted PBKDF2-HMAC-SHA256 password hash, stored as
-     * "pbkdf2_sha256:<iterations>:<saltHex>:<hashHex>".
-     *
-     * Replaces the previous unsalted SHA-256 scheme. Legacy hashes remain verifiable via
-     * [verifyPassword] and are transparently upgraded to PBKDF2 on the next successful login.
-     */
-    private fun hashPassword(password: String): String {
-        val salt = ByteArray(PBKDF2_SALT_BYTES).also { SecureRandom().nextBytes(it) }
-        val hash = pbkdf2(password, salt, PBKDF2_ITERATIONS)
-        return PBKDF2_PREFIX + PBKDF2_ITERATIONS + ":" + salt.toHex() + ":" + hash.toHex()
-    }
-
-    /**
-     * Verifies [password] against a stored hash. Accepts the current PBKDF2 format and the
-     * legacy unsalted SHA-256 format so pre-migration local accounts keep working.
-     */
-    private fun verifyPassword(password: String, stored: String): Boolean {
-        if (stored.startsWith(PBKDF2_PREFIX)) {
-            val parts = stored.split(":")
-            if (parts.size != 4) return false
-            val iterations = parts[1].toIntOrNull() ?: return false
-            val salt = parts[2].hexToBytes() ?: return false
-            val expected = parts[3]
-            return constantTimeEquals(expected, pbkdf2(password, salt, iterations).toHex())
+    companion object {
+        /**
+         * Salted PBKDF2-HMAC-SHA256 password hash, stored as
+         * "pbkdf2_sha256:<iterations>:<saltHex>:<hashHex>".
+         *
+         * Replaces the previous unsalted SHA-256 scheme. Legacy hashes remain verifiable via
+         * [verifyPassword] and are transparently upgraded to PBKDF2 on the next successful login.
+         */
+        internal fun hashPassword(password: String): String {
+            val salt = ByteArray(PBKDF2_SALT_BYTES).also { SecureRandom().nextBytes(it) }
+            val hash = pbkdf2(password, salt, PBKDF2_ITERATIONS)
+            return PBKDF2_PREFIX + PBKDF2_ITERATIONS + ":" + salt.toHex() + ":" + hash.toHex()
         }
-        // Legacy unsalted SHA-256 account (pre-migration only).
-        val legacy = MessageDigest.getInstance("SHA-256").digest(password.toByteArray()).toHex()
-        return constantTimeEquals(stored, legacy)
-    }
 
-    private fun isLegacyHash(stored: String): Boolean = !stored.startsWith(PBKDF2_PREFIX)
+        /**
+         * Verifies [password] against a stored hash. Accepts the current PBKDF2 format and the
+         * legacy unsalted SHA-256 format so pre-migration local accounts keep working.
+         */
+        internal fun verifyPassword(password: String, stored: String): Boolean {
+            if (stored.startsWith(PBKDF2_PREFIX)) {
+                val parts = stored.split(":")
+                if (parts.size != 4) return false
+                val iterations = parts[1].toIntOrNull() ?: return false
+                val salt = parts[2].hexToBytes() ?: return false
+                val expected = parts[3]
+                return constantTimeEquals(expected, pbkdf2(password, salt, iterations).toHex())
+            }
+            // Legacy unsalted SHA-256 account (pre-migration only).
+            val legacy = MessageDigest.getInstance("SHA-256").digest(password.toByteArray()).toHex()
+            return constantTimeEquals(stored, legacy)
+        }
 
-    private fun pbkdf2(password: String, salt: ByteArray, iterations: Int): ByteArray {
-        val spec = PBEKeySpec(password.toCharArray(), salt, iterations, PBKDF2_KEY_BITS)
-        return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
-    }
+        internal fun isLegacyHash(stored: String): Boolean = !stored.startsWith(PBKDF2_PREFIX)
 
-    /** Length-checked constant-time comparison; avoids leaking hash material via timing. */
-    private fun constantTimeEquals(a: String, b: String): Boolean {
-        if (a.length != b.length) return false
-        var diff = 0
-        for (i in a.indices) diff = diff or (a[i].code xor b[i].code)
-        return diff == 0
-    }
+        /**
+         * Local-login decision for an existing [UserProfileEntity]:
+         *  - accounts without a stored hash can NEVER authenticate (closes the old bypass),
+         *  - wrong passwords are rejected,
+         *  - a verifying legacy SHA-256 hash is returned re-hashed as PBKDF2 for upgrade.
+         * Pure and deterministic: unit-testable without Room or Firebase.
+         */
+        internal fun evaluateLocalLogin(
+            localUser: UserProfileEntity,
+            password: String
+        ): LocalLoginDecision {
+            val storedHash = localUser.passwordHash
+            if (storedHash.isNullOrBlank()) {
+                return LocalLoginDecision(
+                    allow = false,
+                    errorMessage = "This account has no local password set. Please reset your password or sign in with Google."
+                )
+            }
+            if (!verifyPassword(password, storedHash)) {
+                return LocalLoginDecision(
+                    allow = false,
+                    errorMessage = "Incorrect password. Please try again."
+                )
+            }
+            return LocalLoginDecision(
+                allow = true,
+                errorMessage = null,
+                upgradedHash = if (isLegacyHash(storedHash)) hashPassword(password) else null
+            )
+        }
 
-    private fun isValidEmail(email: String): Boolean =
-        email.isNotEmpty() && Patterns.EMAIL_ADDRESS.matcher(email).matches()
+        private fun pbkdf2(password: String, salt: ByteArray, iterations: Int): ByteArray {
+            val spec = PBEKeySpec(password.toCharArray(), salt, iterations, PBKDF2_KEY_BITS)
+            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+        }
 
-    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+        /** Length-checked constant-time comparison; avoids leaking hash material via timing. */
+        private fun constantTimeEquals(a: String, b: String): Boolean {
+            if (a.length != b.length) return false
+            var diff = 0
+            for (i in a.indices) diff = diff or (a[i].code xor b[i].code)
+            return diff == 0
+        }
 
-    private fun String.hexToBytes(): ByteArray? {
-        if (length % 2 != 0) return null
-        return try {
-            ByteArray(length / 2) { i -> substring(i * 2, i * 2 + 2).toInt(16).toByte() }
-        } catch (_: NumberFormatException) {
-            null
+        private fun isValidEmail(email: String): Boolean =
+            email.isNotEmpty() && Patterns.EMAIL_ADDRESS.matcher(email).matches()
+
+        private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+        private fun String.hexToBytes(): ByteArray? {
+            if (length % 2 != 0) return null
+            return try {
+                ByteArray(length / 2) { i -> substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+            } catch (_: NumberFormatException) {
+                null
+            }
         }
     }
 
@@ -256,20 +289,15 @@ class ForexAuthManager(
         // here; previously a null hash matched any input password.
         val localUser = forexDao.getUserByEmail(cleanEmail)
         if (localUser != null) {
-            val storedHash = localUser.passwordHash
-            if (storedHash.isNullOrBlank()) {
-                return AuthResultWrapper(
-                    success = false,
-                    errorMessage = "This account has no local password set. Please reset your password or sign in with Google."
-                )
+            val decision = evaluateLocalLogin(localUser, password)
+            if (!decision.allow) {
+                return AuthResultWrapper(success = false, errorMessage = decision.errorMessage)
             }
-            if (!verifyPassword(password, storedHash)) {
-                return AuthResultWrapper(success = false, errorMessage = "Incorrect password. Please try again.")
+            // Transparent credential upgrade: legacy SHA-256 hashes are re-hashed with PBKDF2.
+            decision.upgradedHash?.let { upgradedHash ->
+                forexDao.insertOrUpdateUser(localUser.copy(passwordHash = upgradedHash, isLoggedIn = true))
             }
-            // Transparent credential upgrade: re-hash legacy SHA-256 accounts with PBKDF2.
-            val upgradedHash = if (isLegacyHash(storedHash)) hashPassword(password) else storedHash
             forexDao.logoutAllUsers()
-            forexDao.insertOrUpdateUser(localUser.copy(passwordHash = upgradedHash, isLoggedIn = true))
             forexDao.setActiveUser(localUser.uid)
             return AuthResultWrapper(
                 success = true,
@@ -369,4 +397,14 @@ data class AuthResultWrapper(
     val success: Boolean,
     val user: UserProfile? = null,
     val errorMessage: String? = null
+)
+
+/**
+ * Outcome of [ForexAuthManager.evaluateLocalLogin]: allow/deny decision, the user-facing
+ * error message when denied, and an upgraded PBKDF2 hash when a legacy hash verified.
+ */
+internal data class LocalLoginDecision(
+    val allow: Boolean,
+    val errorMessage: String?,
+    val upgradedHash: String? = null
 )

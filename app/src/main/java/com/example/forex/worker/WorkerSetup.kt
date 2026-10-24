@@ -105,6 +105,6 @@ private fun buildSignalWorkInput(
     }
     .build()
 
-private const val UNIQUE_PERIODIC = "TradeSignalPolling"
+const val UNIQUE_PERIODIC = "TradeSignalPolling"
 private const val UNIQUE_KICKOFF = "TradeSignalKickoff"
 private const val TAG_SIGNAL_SCAN = "trade_signal_scan"
