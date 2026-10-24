@@ -29,3 +29,15 @@
 
 - [ ] Watch provider consoles for unexpected quota usage (key abuse) for the first 48 hours.
 - [ ] File any hotfix as a new PR; do not amend the tagged commit.
+## CI scanners
+
+What runs today and what was removed:
+
+- **CodeQL** (`.github/workflows/codeql.yml`) is the security scanner for this repo and stays enabled. Keep it green.
+- Removed unconfigured starter workflows: `apisec-scan.yml` (needs a paid APIsec account, secrets and a registered API project), `codescan.yml` (Salesforce/Apex scanner, not applicable), `eslint.yml` (no JS/TS in this repo), `sonarcloud.yml` (empty project keys, no SONAR_TOKEN), `detekt.yml` (v1.15.0 CLI from 2020 cannot parse Kotlin 2.2), and `Codeql.yml` (case-only duplicate of `codeql.yml`).
+
+To re-add a scanner properly:
+
+- **SonarCloud:** create the project on sonarcloud.io, set the `SONAR_TOKEN` secret, fill in `projectKey` and `organization`, then re-add the workflow.
+- **Detekt:** add it as a Gradle plugin (`dev.detekt`, see https://detekt.dev) with a checked-in config and baseline, and run `gradle detekt` in the Build & Test job - do not use the detached 2020 CLI starter.
+- **Secrets-based scanners** (APIsec, CodeScan): only after the account exists, the secrets are set, and there is something that tool can actually scan.
