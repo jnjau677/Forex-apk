@@ -57,19 +57,13 @@ data class CandleEntity(
     val high: Double,
     val low: Double,
     val close: Double,
-    val volume: Double
-)
-
-@Entity(tableName = "user_profiles")
-data class UserProfileEntity(
-    @PrimaryKey val uid: String,
-    val email: String,
-    val displayName: String,
-    val photoUrl: String? = null,
-    val passwordHash: String? = null,
-    val accountTier: String = "Pro Trader",
-    val joinedAt: Long = System.currentTimeMillis(),
-    val isLoggedIn: Boolean = true
+    val volume: Double,
+    /**
+     * Provenance of this bar: ALPHA_VANTAGE | FCS_API | SIMULATION
+     * (com.example.forex.data.remote.MarketDataSource). Background signal
+     * generation must refuse SIMULATION rows (REVIEW F-06).
+     */
+    val dataSource: String = "SIMULATION"
 )
 
 @Entity(tableName = "user_settings")

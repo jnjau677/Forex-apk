@@ -1,10 +1,12 @@
 package com.example.forex.data.repository
 
+import android.content.Context
 import com.example.forex.data.db.*
 import com.example.forex.data.model.*
 import com.example.forex.data.remote.MarketDataHealth
 import com.example.forex.data.remote.MarketDataSource
 import com.example.forex.data.remote.RealMarketDataProvider
+import com.example.forex.data.security.SecureApiKeyManager
 import com.example.forex.data.validation.MarketDataValidator
 import com.example.forex.data.websocket.ForexWebSocketManager
 import kotlinx.coroutines.CoroutineScope
@@ -12,25 +14,38 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.round
 import kotlin.random.Random
 
-class ForexRepository(private val forexDao: ForexDao) {
+class ForexRepository(context: Context, private val forexDao: ForexDao) {
+
+    private val appContext = context.applicationContext
+
+    /** Single key read path: encrypted user keys first, bundled BuildConfig fallback (F-05). */
+    private val secureKeys = SecureApiKeyManager.getInstance(appContext)
 
     private val repoScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val _pairs = MutableStateFlow<List<CurrencyPair>>(createInitialPairs())
     val pairs: StateFlow<List<CurrencyPair>> = _pairs.asStateFlow()
 
-    private val candleMap = mutableMapOf<Pair<String, Timeframe>, MutableList<CandleStick>>()
+    /**
+     * Candle cache. Concurrent map + per-list synchronisation: ticks (IO), signal
+     * generation (Default) and Compose reads previously raced on a plain HashMap
+     * of MutableLists (F-10). Readers get snapshots via [getCandles].
+     */
+    private val candleMap = ConcurrentHashMap<Pair<String, Timeframe>, MutableList<CandleStick>>()
 
     // Real-time WebSocket Stream Manager
     val webSocketManager = ForexWebSocketManager()
@@ -38,9 +53,34 @@ class ForexRepository(private val forexDao: ForexDao) {
     val webSocketStatus: StateFlow<WebSocketStatus> = webSocketManager.webSocketStatus
     val marketTicks: SharedFlow<MarketTick> = webSocketManager.marketTicks
 
-    // Real REST market data (Alpha Vantage primary, FCS fallback)
-    val realDataProvider = RealMarketDataProvider()
+    // Real REST market data (Alpha Vantage primary, FCS fallback). Keys are resolved
+    // through SecureApiKeyManager; the Alpha Vantage quota counter is persisted so
+    // process death cannot reset the daily budget (F-10).
+    private val quotaPrefs = appContext.getSharedPreferences("alphavantage_quota", Context.MODE_PRIVATE)
+    val realDataProvider = RealMarketDataProvider(
+        apiKey = secureKeys.getAlphaVantageApiKey().orEmpty(),
+        quotaPersistLoad = {
+            val day = quotaPrefs.getString("day", "").orEmpty()
+            val count = quotaPrefs.getInt("count", 0)
+            day to count
+        },
+        quotaPersistSave = { day, count ->
+            quotaPrefs.edit().putString("day", day).putInt("count", count).apply()
+        }
+    )
     val marketDataHealth: StateFlow<MarketDataHealth> = realDataProvider.health
+
+    private val marketDataService = ForexMarketRepositoryService(
+        apiKey = secureKeys.getFcsApiKey().orEmpty()
+    )
+
+    // --- Price/indicator alerts (F-07) -------------------------------------
+    @Volatile
+    private var alertCache: List<AlertEntity> = emptyList()
+
+    private val _alertTriggers = MutableSharedFlow<CustomAlert>(extraBufferCapacity = 16)
+    /** Emits each alert at the moment its condition first becomes true. */
+    val alertTriggers: SharedFlow<CustomAlert> = _alertTriggers.asSharedFlow()
 
     init {
         // Initialize candle history
@@ -57,7 +97,10 @@ class ForexRepository(private val forexDao: ForexDao) {
                         val generated = generateInitialCandles(pair.currentPrice, tf)
                         candleMap[key] = generated
                         forexDao.insertCandles(generated.map {
-                            CandleEntity(pair.symbol, tf.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
+                            CandleEntity(
+                                pair.symbol, tf.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume,
+                                dataSource = MarketDataSource.SIMULATION.name
+                            )
                         })
                     }
                 }
@@ -68,6 +111,13 @@ class ForexRepository(private val forexDao: ForexDao) {
         repoScope.launch {
             webSocketManager.marketTicks.collect { tick ->
                 applyMarketTick(tick)
+            }
+        }
+
+        // Keep the alert evaluator's cache in sync with Room (F-07).
+        repoScope.launch {
+            forexDao.getAllAlerts().collect { alerts ->
+                alertCache = alerts
             }
         }
     }
@@ -105,7 +155,8 @@ class ForexRepository(private val forexDao: ForexDao) {
                 Timeframe.values().forEach { tf ->
                     val key = Pair(pair.symbol, tf)
                     val candles = candleMap[key]
-                    if (candles != null && candles.isNotEmpty()) {
+                    if (candles != null) synchronized(candles) {
+                        if (candles.isNotEmpty()) {
                         val lastCandle = candles.last()
                         val tfMillis = tf.minutes * 60 * 1000L
 
@@ -133,6 +184,7 @@ class ForexRepository(private val forexDao: ForexDao) {
                             )
                             candles[candles.lastIndex] = updatedLast
                         }
+                        }
                     }
                 }
 
@@ -148,7 +200,78 @@ class ForexRepository(private val forexDao: ForexDao) {
 
         if (pairFound) {
             _pairs.value = updatedList
+            evaluateAlerts(tick)
         }
+    }
+
+    /**
+     * F-07: alerts were previously created/listed but never evaluated. Every usable
+     * tick now checks the symbol's active alerts; the first match flips the alert
+     * to triggered/inactive in Room and emits on [alertTriggers] for notification.
+     * RSI / MA-cross conditions evaluate against the H1 candle snapshot.
+     */
+    private fun evaluateAlerts(tick: MarketTick) {
+        val candidates = alertCache.filter {
+            it.isActive && !it.isTriggered && it.pairSymbol == tick.symbol
+        }
+        if (candidates.isEmpty()) return
+
+        val closes = snapshotCandles(tick.symbol, Timeframe.H1).map { it.close }
+        val rsiNow: Double? = if (closes.size > 15) {
+            TechnicalAnalysisEngine.calculateRSI(closes).lastOrNull()
+        } else null
+        var emaFastNow: Double? = null
+        var emaSlowNow: Double? = null
+        var emaFastPrev: Double? = null
+        var emaSlowPrev: Double? = null
+        if (closes.size > 30) {
+            val fast = TechnicalAnalysisEngine.calculateEMA(closes, 9)
+            val slow = TechnicalAnalysisEngine.calculateEMA(closes, 21)
+            emaFastNow = fast.lastOrNull()
+            emaSlowNow = slow.lastOrNull()
+            emaFastPrev = fast.getOrNull(fast.size - 2)
+            emaSlowPrev = slow.getOrNull(slow.size - 2)
+        }
+
+        candidates.forEach { alert ->
+            val hit = when (runCatching { AlertCondition.valueOf(alert.conditionType) }.getOrNull()) {
+                AlertCondition.PRICE_ABOVE -> tick.price >= alert.targetValue
+                AlertCondition.PRICE_BELOW -> tick.price <= alert.targetValue
+                AlertCondition.RSI_OVERBOUGHT -> rsiNow != null && rsiNow >= alert.targetValue
+                AlertCondition.RSI_OVERSOLD -> rsiNow != null && rsiNow <= alert.targetValue
+                AlertCondition.MA_BULLISH_CROSS ->
+                    emaFastPrev != null && emaSlowPrev != null && emaFastNow != null && emaSlowNow != null &&
+                        emaFastPrev <= emaSlowPrev && emaFastNow > emaSlowNow
+                AlertCondition.MA_BEARISH_CROSS ->
+                    emaFastPrev != null && emaSlowPrev != null && emaFastNow != null && emaSlowNow != null &&
+                        emaFastPrev >= emaSlowPrev && emaFastNow < emaSlowNow
+                null -> false
+            }
+            if (hit) {
+                repoScope.launch {
+                    forexDao.updateAlertStatus(alert.id, triggered = true, active = false)
+                }
+                _alertTriggers.tryEmit(
+                    CustomAlert(
+                        id = alert.id,
+                        pairSymbol = alert.pairSymbol,
+                        condition = runCatching { AlertCondition.valueOf(alert.conditionType) }
+                            .getOrDefault(AlertCondition.PRICE_ABOVE),
+                        targetValue = alert.targetValue,
+                        isTriggered = true,
+                        isActive = false,
+                        note = alert.note,
+                        createdAt = alert.createdAt
+                    )
+                )
+            }
+        }
+    }
+
+    /** Thread-safe snapshot of the cached candle list (never the live mutable list). */
+    private fun snapshotCandles(symbol: String, timeframe: Timeframe): List<CandleStick> {
+        val list = candleMap[Pair(symbol, timeframe)] ?: return emptyList()
+        return synchronized(list) { list.toList() }
     }
 
 
@@ -191,29 +314,36 @@ class ForexRepository(private val forexDao: ForexDao) {
 
     fun getCandles(symbol: String, timeframe: Timeframe): List<CandleStick> {
         val key = Pair(symbol, timeframe)
-        if (!candleMap.containsKey(key)) {
-            val pair = _pairs.value.find { it.symbol == symbol }
-            val price = pair?.currentPrice ?: 1.0
-            val generated = generateInitialCandles(price, timeframe)
-            candleMap[key] = generated
+        candleMap[key]?.let { return synchronized(it) { it.toList() } }
 
-            repoScope.launch {
-                val refreshed = refreshCandlesFromNetwork(symbol, timeframe)
-                if (refreshed != null) {
-                    candleMap[key] = refreshed.first.toMutableList()
-                    forexDao.insertCandles(refreshed.first.map {
-                        CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
-                    })
-                    // Trigger UI update
-                    _pairs.value = _pairs.value.toList()
-                } else {
-                    forexDao.insertCandles(generated.map {
-                        CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
-                    })
-                }
+        val pair = _pairs.value.find { it.symbol == symbol }
+        val price = pair?.currentPrice ?: 1.0
+        val generated = generateInitialCandles(price, timeframe)
+        // putIfAbsent: a tick may have created the entry concurrently (F-10).
+        val winner = candleMap.putIfAbsent(key, generated) ?: generated
+
+        repoScope.launch {
+            val refreshed = refreshCandlesFromNetwork(symbol, timeframe)
+            if (refreshed != null) {
+                candleMap[key] = refreshed.first.toMutableList()
+                forexDao.insertCandles(refreshed.first.map {
+                    CandleEntity(
+                        symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume,
+                        dataSource = refreshed.second.name
+                    )
+                })
+                // Trigger UI update
+                _pairs.value = _pairs.value.toList()
+            } else {
+                forexDao.insertCandles(generated.map {
+                    CandleEntity(
+                        symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume,
+                        dataSource = MarketDataSource.SIMULATION.name
+                    )
+                })
             }
         }
-        return candleMap[key] ?: emptyList()
+        return synchronized(winner) { winner.toList() }
     }
 
     /**
@@ -286,19 +416,25 @@ class ForexRepository(private val forexDao: ForexDao) {
         return null
     }
 
-    private val marketDataService = ForexMarketRepositoryService()
-
     /**
      * Pushes a freshly validated candle series (from any source) into the live cache and
      * Room, then nudges [pairs] so signal regeneration sees the new history immediately.
      */
-    fun ingestCandles(symbol: String, timeframe: Timeframe, candles: List<CandleStick>) {
+    fun ingestCandles(
+        symbol: String,
+        timeframe: Timeframe,
+        candles: List<CandleStick>,
+        source: MarketDataSource = MarketDataSource.SIMULATION
+    ) {
         if (candles.isEmpty()) return
         val trimmed = candles.takeLast(200)
         candleMap[Pair(symbol, timeframe)] = trimmed.toMutableList()
         repoScope.launch {
             forexDao.insertCandles(trimmed.map {
-                CandleEntity(symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume)
+                CandleEntity(
+                    symbol, timeframe.name, it.timestamp, it.open, it.high, it.low, it.close, it.volume,
+                    dataSource = source.name
+                )
             })
         }
         _pairs.value = _pairs.value.toList()
@@ -367,10 +503,8 @@ class ForexRepository(private val forexDao: ForexDao) {
         userQuestion: String? = null,
         quantitativeContext: String = ""
     ): String? {
-        val apiKey = com.example.BuildConfig.OPENROUTER_API_KEY
-        if (apiKey.isBlank() || apiKey == "YOUR_OPENROUTER_API_KEY") {
-            return null
-        }
+        // Resolved via SecureApiKeyManager (user key wins, bundled fallback) — F-05.
+        val apiKey = secureKeys.getOpenRouterApiKey() ?: return null
 
         return try {
             val contextBlock = if (quantitativeContext.isNotBlank()) {

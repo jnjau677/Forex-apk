@@ -124,7 +124,8 @@ object DynamicAiResponseEngine {
         val lower = userText.lowercase(Locale.US)
         fun has(vararg keys: String) = keys.any { lower.contains(it) }
         return when {
-            has("lot", "position size", "sizing", "how much", "risk per trade", "margin") -> AiIntent.POSITION_SIZING
+            // NB: not bare "lot" — it substring-matches "plot" ("plot fib retracement").
+            has("lots", "lot size", "lot calculator", "position size", "sizing", "how much", "risk per trade", "margin") -> AiIntent.POSITION_SIZING
             has("atr", "volatil", "squeeze", "turbulen", "news risk") -> AiIntent.VOLATILITY
             has("fib") -> AiIntent.FIBONACCI
             has("support", "resistance", "zone", "level", "demand", "supply") -> AiIntent.SUPPORT_RESISTANCE

@@ -16,3 +16,7 @@
 local.properties
 .env
 debug.keystore
+
+# Firebase config is injected in CI from the GOOGLE_SERVICES_JSON secret;
+# keep local copies out of version control.
+app/google-services.json

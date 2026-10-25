@@ -9,7 +9,10 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+// SDK 34 sandbox: Robolectric's SDK-36 sandbox requires a Java 21 runtime,
+// while CI builds on JDK 17. The behaviour under test (resource lookup) is
+// identical on 34.
+@Config(sdk = [34])
 class ExampleRobolectricTest {
 
   @Test

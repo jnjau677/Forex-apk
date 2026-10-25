@@ -39,9 +39,11 @@ fun UserAuthAndProfileDialog(
     currentUser: UserProfile?,
     isLoading: Boolean,
     errorMessage: String?,
+    infoMessage: String?,
     onSignInEmail: (String, String) -> Unit,
     onSignUpEmail: (String, String, String) -> Unit,
     onSignInGoogle: () -> Unit,
+    onSendPasswordResetEmail: (String) -> Unit,
     onSignOut: () -> Unit,
     onClearError: () -> Unit,
     onDismiss: () -> Unit
@@ -71,9 +73,11 @@ fun UserAuthAndProfileDialog(
                 AuthFormView(
                     isLoading = isLoading,
                     errorMessage = errorMessage,
+                    infoMessage = infoMessage,
                     onSignInEmail = onSignInEmail,
                     onSignUpEmail = onSignUpEmail,
                     onSignInGoogle = onSignInGoogle,
+                    onSendPasswordResetEmail = onSendPasswordResetEmail,
                     onClearError = onClearError,
                     onDismiss = onDismiss
                 )
@@ -186,7 +190,7 @@ private fun UserProfileView(
                     modifier = Modifier.size(16.dp)
                 )
                 Text(
-                    text = "${user.accountTier} • Verified",
+                    text = if (user.isEmailVerified) "${user.accountTier} • Email Verified" else user.accountTier,
                     style = MaterialTheme.typography.labelSmall.copy(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSecondaryContainer,
@@ -226,11 +230,11 @@ private fun UserProfileView(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Data Security",
+                        text = "Authentication",
                         style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                     )
                     Text(
-                        text = "AES-256 Encrypted",
+                        text = "Firebase Auth",
                         style = MaterialTheme.typography.bodySmall.copy(
                             fontWeight = FontWeight.SemiBold,
                             color = Color(0xFF10B981)
@@ -242,14 +246,35 @@ private fun UserProfileView(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Cloud Sync",
+                        text = "Sign-in Provider",
                         style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                     )
                     Text(
-                        text = "Active",
+                        text = when (user.authProvider) {
+                            "google.com" -> "Google"
+                            "password" -> "Email & Password"
+                            null -> "—"
+                            else -> user.authProvider
+                        },
                         style = MaterialTheme.typography.bodySmall.copy(
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
+                        )
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Email Verified",
+                        style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    )
+                    Text(
+                        text = if (user.isEmailVerified) "Verified" else "Not verified",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (user.isEmailVerified) Color(0xFF10B981) else MaterialTheme.colorScheme.error
                         )
                     )
                 }
@@ -284,9 +309,11 @@ private fun UserProfileView(
 private fun AuthFormView(
     isLoading: Boolean,
     errorMessage: String?,
+    infoMessage: String?,
     onSignInEmail: (String, String) -> Unit,
     onSignUpEmail: (String, String, String) -> Unit,
     onSignInGoogle: () -> Unit,
+    onSendPasswordResetEmail: (String) -> Unit,
     onClearError: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -404,6 +431,38 @@ private fun AuthFormView(
             }
         }
 
+        // Info Banner (e.g. password-reset email sent)
+        AnimatedVisibility(visible = !infoMessage.isNullOrBlank()) {
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Email,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = infoMessage ?: "",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            fontSize = 11.sp
+                        ),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
         // Display Name (if Sign Up)
         if (isSignUp) {
             OutlinedTextField(
@@ -469,7 +528,20 @@ private fun AuthFormView(
             modifier = Modifier.fillMaxWidth().testTag("input_password")
         )
 
-        Spacer(modifier = Modifier.height(18.dp))
+        // Forgot password (sign-in mode only; Firebase sends the reset email)
+        if (!isSignUp) {
+            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+                TextButton(
+                    onClick = { onSendPasswordResetEmail(email) },
+                    enabled = !isLoading,
+                    modifier = Modifier.testTag("forgot_password_btn")
+                ) {
+                    Text("Forgot password?", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(if (isSignUp) 18.dp else 6.dp))
 
         // Primary Submit Button
         Button(
@@ -542,6 +614,17 @@ private fun AuthFormView(
                 }
                 .padding(4.dp)
                 .testTag("toggle_auth_mode_text")
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Text(
+            text = "Secured by Firebase Authentication — passwords are never stored on this device.",
+            style = MaterialTheme.typography.bodySmall.copy(
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 10.sp
+            ),
+            modifier = Modifier.padding(horizontal = 8.dp)
         )
     }
 }
