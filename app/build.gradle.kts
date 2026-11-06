@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.util.Properties
 
 plugins {
   alias(libs.plugins.android.application)
@@ -48,6 +49,23 @@ android {
     }
     debug { signingConfig = signingConfigs.getByName("debugConfig") }
   }
+
+  // Load secrets properties file
+  val secretsProperties = Properties()
+  val secretsFile = file("${rootDir}/.env")
+  if (secretsFile.exists()) {
+      secretsProperties.load(secretsFile.inputStream())
+  } else {
+      val defaultSecretsFile = file("${rootDir}/.env.example")
+      if (defaultSecretsFile.exists()) {
+          secretsProperties.load(defaultSecretsFile.inputStream())
+      }
+  }
+
+  // Define build config fields from secrets
+  buildConfigField("String", "FCS_API_KEY", "\"${secretsProperties.getProperty("FCS_API_KEY", "YOUR_FCS_API_KEY")}\"")
+  buildConfigField("String", "OPENROUTER_API_KEY", "\"${secretsProperties.getProperty("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY")}\"")
+  buildConfigField("String", "ALPHAVANTAGE_API_KEY", "\"${secretsProperties.getProperty("ALPHAVANTAGE_API_KEY", "YOUR_ALPHAVANTAGE_API_KEY")}\"")
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
